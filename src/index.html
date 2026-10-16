@@ -394,6 +394,9 @@ const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? '—' : v.toLocaleString('ru-RU', { minimumFractionDigits: d, maximumFractionDigits: d }).replace('-', '−');
 const sign = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+// затраты хранятся положительными, показываются со знаком минус
+const fmtCost = (v, d = 0) => fmt(v ? -v : 0, d);
+const costTd = (v, d = 0) => `<td class="n ${v ? 'neg' : ''}">${fmtCost(v, d)}</td>`;
 // подписи осей: «57 млн», «350 тыс.» — длинные числа не помещаются и обрезаются слева
 const fmtAxis = v => { const a = Math.abs(v); return a >= 1e6 ? fmt(v / 1e6, a >= 1e7 ? 0 : 1) + ' млн' : a >= 1e3 ? fmt(v / 1e3, 0) + ' тыс.' : fmt(v); };
 const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
@@ -482,8 +485,9 @@ function buildAccount(reps) {
   for (const r of reps) for (const id in r.secTrades) {
     if (seenSec.has(id)) continue; seenSec.add(id);
     const [d, cls, amt, name, side, amtNkd] = r.secTrades[id]; const t = secByDay[d] || (secByDay[d] = { shares: 0, bonds: 0, funds: 0 }); t[cls] += amt;
-    const f = (secFlow[d] || (secFlow[d] = {}))[name] || (secFlow[d][name] = { buy: 0, sell: 0 });
-    if (side > 0) f.buy += amtNkd || amt; else f.sell += amtNkd || amt;
+    const f = (secFlow[d] || (secFlow[d] = {}))[name] || (secFlow[d][name] = { buy: 0, sell: 0, nkdBuy: 0, nkdSell: 0 });
+    const nkd = amtNkd ? amtNkd - amt : 0;     // НКД сделки = сумма с НКД − сумма без НКД
+    if (side > 0) { f.buy += amtNkd || amt; f.nkdBuy += nkd; } else { f.sell += amtNkd || amt; f.nkdSell += nkd; }
   }
   const days = [];
   let prevPending = null, prevDate = null;
@@ -556,24 +560,33 @@ function buildAccount(reps) {
   }
   // Фондовый рынок, по бумагам: результат дня = стоимость на конец − на начало (с НКД, вместе с плановыми позициями:
   // купленное до поставки, проданное до списания, выданное в заём и в РЕПО) − купили + продали + купоны/дивиденды по бумаге.
+  const bondNeed = {}; days.bonds = bondNeed;
   for (const d of days) {
     d.paper = {}; d.paperTotal = 0;
     if (d.partial && !d.r.period.last) continue;       // по справке за период — результат бумаг за весь период последним днём
     const r = d.r;
     // сделки и купоны: за день, а для справки за период — за все её дни
     const flowDates = d.partial ? Object.keys(secFlow).filter(x => x >= r.period.from && x <= r.period.to) : [d.date];
-    const flow = {}; for (const fd of flowDates) for (const n in secFlow[fd] || {}) { const t = flow[n] || (flow[n] = { buy: 0, sell: 0 }); t.buy += secFlow[fd][n].buy; t.sell += secFlow[fd][n].sell; }
+    const flow = {}; for (const fd of flowDates) for (const n in secFlow[fd] || {}) { const t = flow[n] || (flow[n] = { buy: 0, sell: 0, nkdBuy: 0, nkdSell: 0 }); for (const k in t) t[k] += secFlow[fd][n][k]; }
     const credits = d.partial ? days.filter(x => x.partial && x.date >= r.period.from && x.date <= r.period.to).flatMap(x => x.r.credits || []) : (r.credits || []);
     const names = new Set([...Object.keys(r.holdings), ...Object.keys(r.planned), ...Object.keys(flow)]);
     for (const n of names) {
-      const h = r.holdings[n] || {}, pl = r.planned[n] || {}, f = flow[n] || { buy: 0, sell: 0 };
+      const h = r.holdings[n] || {}, pl = r.planned[n] || {}, f = flow[n] || { buy: 0, sell: 0, nkdBuy: 0, nkdSell: 0 };
       const v1 = (h.val || 0) + (pl.val || 0), v0 = (h.val0 || 0) + (pl.val0 || 0);
       const isin = h.isin || pl.isin || '';
-      const income = credits.filter(c => (c.cls === 'coupon' || c.cls === 'dividend' || c.cls === 'redemption') &&
-          ((isin && (c.comment || '').includes(isin)) || (c.instr && (c.instr === n || c.instr.includes(n)))))
-        .reduce((a, c) => a + c.amount + grossTax(c), 0);
-      const pnl = v1 - v0 - f.buy + f.sell + income;
-      d.paper[n] = { pnl, v0, v1, buy: f.buy, sell: f.sell, income, qty: h.qty || 0, cls: h.cls || pl.cls || 'shares', isin: h.isin || pl.isin || '' };
+      const mine = credits.filter(c => (c.cls === 'coupon' || c.cls === 'dividend' || c.cls === 'redemption') &&
+          ((isin && (c.comment || '').includes(isin)) || (c.instr && (c.instr === n || c.instr.includes(n)))));
+      const income = mine.reduce((a, c) => a + c.amount + grossTax(c), 0);
+      const coupon = mine.filter(c => c.cls === 'coupon').reduce((a, c) => a + c.amount + grossTax(c), 0);
+      const pnl = v1 - v0 - f.buy + f.sell + income, cls = h.cls || pl.cls || 'shares';
+      // НКД внутри оценки позиции: оценка брокера = (цена закрытия + НКД биржи) × кол-во, долю НКД берём с Мосбиржи
+      let nkd0 = 0, nkd1 = 0;
+      if (cls === 'bonds' && isin) {
+        (bondNeed[isin] || (bondNeed[isin] = [])).push(d.partial ? r.period.from : d.date, d.date);
+        if (v1) nkd1 = v1 * nkdShare(isin, d.date, true);
+        if (v0) nkd0 = v0 * nkdShare(isin, d.partial ? r.period.from : d.date, false);
+      }
+      d.paper[n] = { pnl, v0, v1, buy: f.buy, sell: f.sell, income, coupon, nkdBuy: f.nkdBuy, nkdSell: f.nkdSell, nkd0, nkd1, qty: h.qty || 0, cls, isin };
       d.paperTotal += pnl;
     }
   }
@@ -677,6 +690,45 @@ function applyRates(days, rates) {
 
 const ISS = { swap: {}, tried: new Set() };
 try { Object.assign(ISS.swap, JSON.parse(localStorage.getItem('fba-iss-swap') || '{}')); } catch (e) { }
+// облигации: на дату торгов — доля НКД в «грязной» цене, НКД / (цена закрытия × номинал / 100 + НКД)
+ISS.bond = {};
+try { Object.assign(ISS.bond, JSON.parse(localStorage.getItem('fba-iss-bond') || '{}')); } catch (e) { }
+// для конца дня — последний торговый день не позже даты, для начала — строго раньше; данные старше 10 дней не берём
+function nkdShare(isin, date, incl) {
+  const m = ISS.bond[isin]; if (!m) return NaN;
+  let best = ''; for (const k in m) if (k[0] !== '_' && (incl ? k <= date : k < date) && k > best) best = k;
+  return best && (Date.parse(date) - Date.parse(best)) / 864e5 <= 10 ? m[best] : NaN;
+}
+async function loadIssBonds() {
+  if (!M) return false;
+  const need = {};
+  for (const a of M.accs) for (const [isin, ds] of Object.entries(M.res[a].days.bonds || {})) {
+    const n = need[isin] || (need[isin] = [ds[0], ds[0]]); for (const x of ds) { if (x < n[0]) n[0] = x; if (x > n[1]) n[1] = x; }
+  }
+  let changed = false;
+  for (const isin in need) {
+    const from = addDays(need[isin][0], -10), to = need[isin][1], have = ISS.bond[isin] || {};
+    if (have._from && have._from <= from && have._till >= to) continue;
+    if (ISS.tried.has(isin + from + to)) continue; ISS.tried.add(isin + from + to);
+    try {
+      const q = await (await fetch(`https://iss.moex.com/iss/securities.json?q=${isin}&iss.meta=off&securities.columns=secid,isin,primary_boardid`)).json();
+      const sec = (q.securities?.data || []).find(x => x[1] === isin); if (!sec) continue;
+      const m = {};
+      for (let start = 0; start < 5000; start += 100) {
+        const u = `https://iss.moex.com/iss/history/engines/stock/markets/bonds/securities/${encodeURIComponent(sec[0])}.json?from=${from}&till=${to}&start=${start}&iss.meta=off&history.columns=BOARDID,TRADEDATE,CLOSE,LEGALCLOSEPRICE,ACCINT,FACEVALUE`;
+        const rows = (await (await fetch(u)).json()).history?.data || [];
+        for (const [b, dt, cl, lc, ai, fv] of rows) { const pr = cl ?? lc; if (b === sec[2] && pr != null && ai != null && fv) m[dt] = ai / (pr * fv / 100 + ai); }
+        if (rows.length < 100) break;
+      }
+      const got = Object.keys(m).sort(); if (!got.length) continue;
+      // _till — последний день, за который биржа уже дала данные: следующая загрузка дозапросит более поздние
+      ISS.bond[isin] = { ...have, ...m, _from: have._from && have._from < from ? have._from : from, _till: have._till && have._till > got.at(-1) ? have._till : got.at(-1) };
+      changed = true;
+    } catch (e) { /* нет сети или биржа недоступна — купонный доход по этой бумаге останется неизвестным */ }
+  }
+  if (changed) try { localStorage.setItem('fba-iss-bond', JSON.stringify(ISS.bond)); } catch (e) { }
+  return changed;
+}
 async function loadIssSwap() {
   if (!M) return false;
   let changed = false;
@@ -846,10 +898,10 @@ V.summary = (el, sel) => {
   const gcost = k => Object.values(G.P[k].costs).reduce((a, b) => a + b, 0);
   // затраты в другом масштабе — линией по правой оси
   const op = baseOpts(false);
-  op.scales.y2 = { position: 'right', beginAtZero: true, grid: { display: false }, title: { display: true, text: 'затраты, ₽', color: css('--dim') }, ticks: { color: css('--c4'), callback: v => fmtAxis(v) } };
-  op.plugins.tooltip.callbacks.label = c => c.dataset.yAxisID === 'y2' ? `Затраты: −${fmt(c.parsed.y)} ₽` : `Прибыль: ${fmt(c.parsed.y)} ₽`;
+  op.scales.y2 = { position: 'right', beginAtZero: true, max: 0, grid: { display: false }, title: { display: true, text: 'затраты, ₽', color: css('--dim') }, ticks: { color: css('--c4'), callback: v => fmtAxis(v) } };
+  op.plugins.tooltip.callbacks.label = c => c.dataset.yAxisID === 'y2' ? `Затраты: ${fmt(c.parsed.y)} ₽` : `Прибыль: ${fmt(c.parsed.y)} ₽`;
   chart(document.getElementById('cPnl'), { type: 'bar', options: op, data: { labels: G.keys.map(k => periodLabel(k, state.group)), datasets: [
-    { type: 'line', label: 'Затраты (правая ось)', data: G.keys.map(k => gcost(k)), yAxisID: 'y2', borderColor: css('--c4'), backgroundColor: css('--c4'), borderWidth: 2, pointRadius: 2, order: 0 },
+    { type: 'line', label: 'Затраты (правая ось)', data: G.keys.map(k => -gcost(k)), yAxisID: 'y2', borderColor: css('--c4'), backgroundColor: css('--c4'), borderWidth: 2, pointRadius: 2, order: 0 },
     { label: 'Прибыль', data: G.keys.map(k => G.P[k].pnl), backgroundColor: G.keys.map(k => G.P[k].pnl >= 0 ? css('--gain') : css('--loss')), order: 1 } ] } });
   // стоимость счёта на конец периода и накопленная прибыль — в той же группировке, что и остальные графики
   let cum = 0; const cumS = G.keys.map(k => (cum += G.P[k].pnl));
@@ -876,18 +928,18 @@ V.costs = (el, sel) => {
     <h2>Статьи затрат</h2>
     <div class="tbl"><table><thead><tr><th>Статья</th><th class="n">Сумма, ₽</th><th class="n">Доля</th><th class="n">₽ на лот</th><th class="n">% годовых от счёта</th>
       ${G.keys.map(k => `<th class="n">${periodLabel(k, state.group)}</th>`).join('')}</tr></thead><tbody>
-      ${ks.map(k => `<tr><td>${k[1]}</td><td class="n">${fmt(t.byCost[k[0]])}</td><td class="n">${fmt(t.byCost[k[0]] / t.costs * 100, 1)}%</td>
+      ${ks.map(k => `<tr><td>${k[1]}</td>${costTd(t.byCost[k[0]])}<td class="n">${fmt(t.byCost[k[0]] / t.costs * 100, 1)}%</td>
         <td class="n">${t.lots ? fmt(t.byCost[k[0]] / t.lots, 3) : '—'}</td><td class="n">${fmt(t.avgEq ? t.byCost[k[0]] / t.avgEq * yr * 100 : NaN, 2)}%</td>
-        ${G.keys.map(p => `<td class="n">${fmt(G.P[p].costs[k[0]] || 0)}</td>`).join('')}</tr>`).join('')}
-      <tr class="tot"><td>Итого</td><td class="n neg">−${fmt(t.costs)}</td><td class="n">100%</td><td class="n">${t.lots ? fmt(t.costs / t.lots, 3) : '—'}</td>
+        ${G.keys.map(p => costTd(G.P[p].costs[k[0]] || 0)).join('')}</tr>`).join('')}
+      <tr class="tot"><td>Итого</td>${costTd(t.costs)}<td class="n">100%</td><td class="n">${t.lots ? fmt(t.costs / t.lots, 3) : '—'}</td>
         <td class="n">${fmt(t.avgEq ? t.costs / t.avgEq * yr * 100 : NaN, 2)}%</td>
-        ${G.keys.map(p => `<td class="n">${fmt(Object.values(G.P[p].costs).reduce((a, b) => a + b, 0))}</td>`).join('')}</tr>
+        ${G.keys.map(p => costTd(Object.values(G.P[p].costs).reduce((a, b) => a + b, 0))).join('')}</tr>
     </tbody></table></div>
     <h2>Движения денег и налоги</h2>
     <p class="note">Не затраты брокера, но меняют счёт: ввод и вывод в прибыль не входят, налог уменьшает прибыль.</p>
     <div class="tbl"><table><thead><tr><th>Статья</th><th class="n">Сумма, ₽</th>${G.keys.map(k => `<th class="n">${periodLabel(k, state.group)}</th>`).join('')}</tr></thead><tbody>
       ${[['tax', 'Налоги (уплачено и удержано)']].map(([k, n]) =>
-        `<tr><td>${n}</td><td class="n">${fmt(t[k])}</td>${G.keys.map(p => `<td class="n">${fmt(G.P[p][k])}</td>`).join('')}</tr>`).join('')}
+        `<tr><td>${n}</td>${costTd(t[k])}${G.keys.map(p => costTd(G.P[p][k])).join('')}</tr>`).join('')}
     </tbody></table></div>
     <h2>Все движения денег</h2>
     <div class="tbl"><table><thead><tr><th>Счёт</th><th>Дата</th><th>Вид</th><th>Операция</th><th class="n">Сумма, ₽</th><th>Комментарий брокера</th></tr></thead><tbody>
@@ -902,10 +954,10 @@ V.costs = (el, sel) => {
         || '<tr><td colspan="6">В загруженных справках купонов и дивидендов нет. Загрузите справки за дни выплат.</td></tr>'}
     </tbody></table></div>
     <h2>Неторговые списания брокера</h2><div class="tbl"><table><thead><tr><th>Счёт</th><th>Дата</th><th>Статья</th><th class="n">Сумма, ₽</th><th>Комментарий брокера</th></tr></thead><tbody>
-      ${sel.flatMap(s => s.days.flatMap(d => d.r.nontrade.map(n => `<tr><td>${esc(s.acc)}</td><td>${d.date}</td><td>${esc((COST_KEYS.find(k => k[0] === n.cls) || [, n.type])[1])}</td><td class="n">${fmt(n.amount, 2)}</td><td>${n.comment ? esc(n.comment) : '<span class="warn">без расшифровки (краткий формат справки)</span>'}</td></tr>`))).join('') || '<tr><td colspan="5">нет</td></tr>'}
+      ${sel.flatMap(s => s.days.flatMap(d => d.r.nontrade.map(n => `<tr><td>${esc(s.acc)}</td><td>${d.date}</td><td>${esc((COST_KEYS.find(k => k[0] === n.cls) || [, n.type])[1])}</td>${costTd(n.amount, 2)}<td>${n.comment ? esc(n.comment) : '<span class="warn">без расшифровки (краткий формат справки)</span>'}</td></tr>`))).join('') || '<tr><td colspan="5">нет</td></tr>'}
     </tbody></table></div>`;
   chart(document.getElementById('cCosts'), { type: 'bar', options: baseOpts(true), data: { labels: G.keys.map(k => periodLabel(k, state.group)),
-    datasets: ks.map(k => ({ label: k[1], data: G.keys.map(p => G.P[p].costs[k[0]] || 0), backgroundColor: css(COLORS[COST_KEYS.indexOf(k)]) })) } });
+    datasets: ks.map(k => ({ label: k[1], data: G.keys.map(p => -(G.P[p].costs[k[0]] || 0)), backgroundColor: css(COLORS[COST_KEYS.indexOf(k)]) })) } });
 };
 
 V.rates = (el, sel) => {
@@ -973,8 +1025,8 @@ V.instr = (el, sel) => {
     </div>
     <h2>Все инструменты</h2>
     <div class="tbl"><table id="tInstr"><thead><tr>${cols.map(c => `<th data-k="${c[0]}" class="${c[0] === 'k' ? '' : 'n'}">${c[1]}${sk[0] === c[0] ? (sk[1] > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>
-      ${list.map(a => `<tr>${cols.map(c => c[0] === 'k' ? `<td>${esc(a.k)}</td>` : `<td class="n ${['vm', 'vmPrice', 'funding', 'net'].includes(c[0]) ? sign(a[c[0]]) : ''}">${fmt(a[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>`).join('')}
-      <tr class="tot">${cols.map(c => c[0] === 'k' ? '<td>Итого</td>' : `<td class="n">${fmt(T[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>
+      ${list.map(a => `<tr>${cols.map(c => c[0] === 'k' ? `<td>${esc(a.k)}</td>` : c[0] === 'broker' || c[0] === 'fee' ? costTd(a[c[0]]) : `<td class="n ${['vm', 'vmPrice', 'funding', 'net'].includes(c[0]) ? sign(a[c[0]]) : ''}">${fmt(a[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>`).join('')}
+      <tr class="tot">${cols.map(c => c[0] === 'k' ? '<td>Итого</td>' : c[0] === 'broker' || c[0] === 'fee' ? costTd(T[c[0]]) : `<td class="n">${fmt(T[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>
     </tbody></table></div>`;
   el.querySelectorAll('#instrMode button').forEach(b => b.onclick = () => { state.instrBase = b.dataset.b === '1'; render(); });
   el.querySelectorAll('#tInstr th').forEach(th => th.onclick = () => { const k = th.dataset.k; state.sort.instr = [k, sk[0] === k ? -sk[1] : -1]; render(); });
@@ -982,7 +1034,7 @@ V.instr = (el, sel) => {
   chart(document.getElementById('cInstr'), { type: 'bar', options: hbarOpts(), data: { labels: top.map(a => a.k), datasets: [{ label: 'Итог после затрат', data: top.map(a => a.net), backgroundColor: top.map(a => a.net >= 0 ? css('--gain') : css('--loss')) }] } });
   const topF = [...list].sort((a, b) => b.fee - a.fee).slice(0, 15);
   chart(document.getElementById('cInstrFee'), { type: 'bar', options: hbarOpts(),
-    data: { labels: topF.map(a => a.k), datasets: [{ label: 'Биржевой сбор', data: topF.map(a => a.fee), backgroundColor: css('--c4') }] } });
+    data: { labels: topF.map(a => a.k), datasets: [{ label: 'Биржевой сбор', data: topF.map(a => -a.fee), backgroundColor: css('--c4') }] } });
 };
 
 // ставка меняется (вслед за ключевой), поэтому для дня берётся пеня ближайшего по времени дня
@@ -1005,33 +1057,47 @@ V.stock = (el, sel) => {
   for (const s of sel) {
     for (const d of s.days) {
       for (const n in d.paper) {
-        const p = d.paper[n], k = n, a = A[k] || (A[k] = { k, cls: p.cls, isin: p.isin, pnl: 0, buy: 0, sell: 0, income: 0, v0: null, v1: 0, qty: 0, last: '' });
-        if (a.v0 === null) a.v0 = p.v0;
+        const p = d.paper[n], k = n, a = A[k] || (A[k] = { k, cls: p.cls, isin: p.isin, pnl: 0, buy: 0, sell: 0, income: 0, v0: null, v1: 0, qty: 0, last: '',
+          coupon: 0, nkdBuy: 0, nkdSell: 0, nkd0: 0, nkd1: 0 });
+        if (a.v0 === null) { a.v0 = p.v0; a.nkd0 = p.nkd0; }
         a.pnl += p.pnl; a.buy += p.buy; a.sell += p.sell; a.income += p.income;
-        if (d.date >= a.last) { a.last = d.date; a.v1 = p.v1; a.qty = p.qty; }
+        a.coupon += p.coupon || 0; a.nkdBuy += p.nkdBuy || 0; a.nkdSell += p.nkdSell || 0;
+        if (d.date >= a.last) { a.last = d.date; a.v1 = p.v1; a.qty = p.qty; a.nkd1 = p.nkd1; }
         total += p.pnl;
       }
     }
     const t = totals([s]); residual += t.stock;
   }
   const list = Object.values(A).filter(a => Math.abs(a.pnl) > 0.5 || a.v1 || a.buy || a.sell);
+  // облигации: купонный доход = купоны − НКД уплаченный + НКД полученный + прирост НКД в позиции; цена — остальное
+  for (const a of list) if (a.cls === 'bonds') {
+    a.nkdPos = (a.nkd1 || 0) - (a.nkd0 || 0);
+    a.cpn = a.coupon - a.nkdBuy + a.nkdSell + a.nkdPos; a.px = isFinite(a.cpn) ? a.pnl - a.cpn : NaN;
+  } else a.cpn = a.px = a.nkdPos = null;
+  const bl = list.filter(a => a.cls === 'bonds'), nkdKnown = bl.every(a => isFinite(a.cpn));
+  const bsum = k => bl.reduce((t, a) => t + a[k], 0);
   const sk = state.sort.stock || ['pnl', 1];
   list.sort((x, y) => (x[sk[0]] > y[sk[0]] ? 1 : x[sk[0]] < y[sk[0]] ? -1 : 0) * sk[1]);
   const byCls = {}; for (const a of list) byCls[a.cls] = (byCls[a.cls] || 0) + a.pnl;
   const money = v => `<span class="${sign(v)}">${v < 0 ? '−' : ''}${fmt(Math.abs(v))} ₽</span>`;
-  const cols = [['k', 'Бумага'], ['cls', 'Вид'], ['qty', 'Кол-во на конец'], ['v0', 'Стоимость на начало'], ['buy', 'Купили'], ['sell', 'Продали'], ['income', 'Купоны, дивиденды'], ['v1', 'Стоимость на конец'], ['pnl', 'Результат']];
+  const cols = [['k', 'Бумага'], ['cls', 'Вид'], ['qty', 'Кол-во на конец'], ['v0', 'Стоимость на начало'], ['buy', 'Купили'], ['sell', 'Продали'], ['income', 'Купоны, дивиденды'], ['v1', 'Стоимость на конец'], ['pnl', 'Результат'],
+                ['nkdBuy', 'НКД уплачен'], ['nkdSell', 'НКД получен'], ['nkdPos', 'Прирост НКД в позиции'], ['cpn', 'Купонный доход'], ['px', 'Изменение цены']];
+  const bv = (a, k, d = 0) => a.cls !== 'bonds' ? '<td></td>' : !isFinite(a[k]) ? '<td class="n" title="нет данных Мосбиржи">—</td>' : `<td class="n ${k === 'cpn' || k === 'px' ? sign(a[k]) : ''}">${fmt(a[k], d)}</td>`;
   el.innerHTML = `
     <div class="grid kpis">
       ${kpi('Результат по бумагам', money(total), 'переоценка и сделки, с НКД')}
       ${Object.keys(CLS).filter(c => c in byCls).map(c => kpi('в т.ч. ' + CLS[c], money(byCls[c]), '')).join('')}
       ${kpi('Прочее', money(residual - total), 'фондовый остаток сводки минус бумаги: проценты по займу бумаг, РЕПО и т. п.')}
+      ${bl.length ? kpi('Облигации: купонный доход', nkdKnown ? money(bsum('cpn')) : '—', nkdKnown ? 'купоны и НКД' : 'нет данных Мосбиржи о НКД') + kpi('Облигации: изменение цены', nkdKnown ? money(bsum('px')) : '—', 'результат облигаций минус купонный доход') : ''}
     </div>
     <p class="note">Результат бумаги за день = стоимость на конец дня − на начало (оценка брокера с НКД, вместе с плановыми позициями: купленное до поставки, проданное до списания, выданное в заём и в РЕПО) − купили + продали (суммы сделок с НКД) + купоны и дивиденды по ней. Брокерская комиссия по бумагам сюда не входит — она в затратах. Стоимость на начало — на первый день периода, на конец — на последний.</p>
+    <p class="note">Облигации: <b>купонный доход</b> = купоны − НКД, уплаченный при покупках, + НКД, полученный при продажах, + прирост НКД, накопленного в позиции; <b>изменение цены</b> — остальная часть результата. НКД сделок и купоны — из справки. НКД в позиции справка отдельно не показывает: его доля в оценке брокера берётся с Мосбиржи (НКД / (цена закрытия + НКД) на дату). Нет связи с биржей — в этих колонках прочерк, общий результат бумаги от этого не меняется.</p>
     <h2>Результат по периодам</h2><div class="chart"><canvas id="cStock"></canvas></div>
     <h2>Все бумаги</h2>
     <div class="tbl"><table id="tStock"><thead><tr>${cols.map(c => `<th data-k="${c[0]}" class="${['k', 'cls'].includes(c[0]) ? '' : 'n'}">${c[1]}${sk[0] === c[0] ? (sk[1] > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>
-      ${list.map(a => `<tr><td title="${esc(a.isin)}">${esc(a.k)}</td><td>${CLS[a.cls] || a.cls}</td><td class="n">${fmt(a.qty)}</td><td class="n">${fmt(a.v0)}</td><td class="n">${fmt(a.buy)}</td><td class="n">${fmt(a.sell)}</td><td class="n">${a.income ? fmt(a.income) : ''}</td><td class="n">${fmt(a.v1)}</td><td class="n ${sign(a.pnl)}">${fmt(a.pnl)}</td></tr>`).join('') || '<tr><td colspan="9">бумаг нет</td></tr>'}
-      <tr class="tot"><td>Итого</td><td></td><td></td><td></td><td class="n">${fmt(list.reduce((a, x) => a + x.buy, 0))}</td><td class="n">${fmt(list.reduce((a, x) => a + x.sell, 0))}</td><td class="n">${fmt(list.reduce((a, x) => a + x.income, 0))}</td><td></td><td class="n ${sign(total)}">${fmt(total)}</td></tr>
+      ${list.map(a => `<tr><td title="${esc(a.isin)}">${esc(a.k)}</td><td>${CLS[a.cls] || a.cls}</td><td class="n">${fmt(a.qty)}</td><td class="n">${fmt(a.v0)}</td><td class="n">${fmt(a.buy)}</td><td class="n">${fmt(a.sell)}</td><td class="n">${a.income ? fmt(a.income) : ''}</td><td class="n">${fmt(a.v1)}</td><td class="n ${sign(a.pnl)}">${fmt(a.pnl)}</td>${bv(a, 'nkdBuy')}${bv(a, 'nkdSell')}${bv(a, 'nkdPos')}${bv(a, 'cpn')}${bv(a, 'px')}</tr>`).join('') || '<tr><td colspan="14">бумаг нет</td></tr>'}
+      <tr class="tot"><td>Итого</td><td></td><td></td><td></td><td class="n">${fmt(list.reduce((a, x) => a + x.buy, 0))}</td><td class="n">${fmt(list.reduce((a, x) => a + x.sell, 0))}</td><td class="n">${fmt(list.reduce((a, x) => a + x.income, 0))}</td><td></td><td class="n ${sign(total)}">${fmt(total)}</td>
+        ${bl.length ? ['nkdBuy', 'nkdSell', 'nkdPos', 'cpn', 'px'].map(k => `<td class="n ${k === 'cpn' || k === 'px' ? sign(bsum(k)) : ''}">${fmt(bsum(k))}</td>`).join('') : '<td colspan="5"></td>'}</tr>
     </tbody></table></div>`;
   el.querySelectorAll('#tStock th').forEach(th => th.onclick = () => { const k = th.dataset.k; state.sort.stock = [k, sk[0] === k ? -sk[1] : -1]; render(); });
   const P = {};
@@ -1062,9 +1128,9 @@ V.margin = (el, sel) => {
       ${kpi('ГО на ' + (dates.length ? ddmm(dates.at(-1)) : '—'), fmt(go.at(-1)) + ' ₽', `${fmt(eq.at(-1) ? go.at(-1) / eq.at(-1) * 100 : NaN, 1)}% от стоимости счёта`)}
       ${kpi('Максимум ГО', fmt(Math.max(0, ...go)) + ' ₽', dates.length ? ddmm(dates[go.indexOf(Math.max(...go))]) : '')}
       ${kpi('Деньги на конец дня', fmt(cash.at(-1)) + ' ₽', 'остаток на Т+1, после расчётов: ' + fmt(t1.at(-1)) + ' ₽')}
-      ${kpi('Перенесено через РЕПО', fmt(repoVol.reduce((a, b) => a + b, 0)) + ' ₽', `${repoVol.filter(v => v).length} дн. · цена переноса ${fmt(repoCost.reduce((a, b) => a + b, 0))} ₽`, repoVol.some(v => v) ? 'bad' : '')}
+      ${kpi('Перенесено через РЕПО', fmt(repoVol.reduce((a, b) => a + b, 0)) + ' ₽', `${repoVol.filter(v => v).length} дн. · цена переноса ${fmtCost(repoCost.reduce((a, b) => a + b, 0))} ₽`, repoVol.some(v => v) ? 'bad' : '')}
       ${kpi('Дней с платой за нехватку ГО', String(shortDays.length), 'из ' + dates.length, shortDays.length ? 'bad' : '')}
-      ${kpi('Плата за нехватку ГО', fmt(fees.reduce((a, b) => a + b, 0)) + ' ₽', 'за выбранный период', shortDays.length ? 'bad' : '')}
+      ${kpi('Плата за нехватку ГО', fmtCost(fees.reduce((a, b) => a + b, 0)) + ' ₽', 'за выбранный период', shortDays.length ? 'bad' : '')}
     </div>
     ${hadPartial ? '<p class="note warn">Дни, покрытые справкой за период, здесь не показаны: ГО, деньги и остаток на Т+1 по дням есть только в однодневных справках.</p>' : ''}
     <p class="note">ГО — «Оценка позиции по ПФИ» на конец дня. Деньги — исходящий рублёвый остаток. «Долг, покрытый бумагами» — часть ГО сверх денег, которую брокер покрывает ценными бумагами («Задолженность прочая»). Брокер берёт плату за нехватку ГО в дни, когда ГО больше обеспечения по его собственным дисконтам — их справка не показывает, поэтому здесь видны только фактические списания.</p>
@@ -1079,7 +1145,7 @@ V.margin = (el, sel) => {
     <h2>Позиции на конец ${lastDay ? ddmm(lastDay) : ''}</h2>
     <div class="posgrid">${Object.entries(pos).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).map(([c, v]) => `<div class="poscell"><span>${esc(c)}</span><b class="${sign(v)}">${fmt(v)}</b></div>`).join('') || '<p class="note">нет позиций</p>'}</div>
     <h2>Обязательства по дням</h2><p class="note">Нажмите на строку, чтобы показать позиции на конец этого дня.</p><div class="tbl"><table><thead><tr><th>Дата</th><th class="n">ГО</th><th class="n">ГО / счёт</th><th class="n">Деньги на конец дня</th><th class="n">Остаток на Т+1 (после расчётов)</th><th class="n">Перенесено через РЕПО</th><th class="n">Цена переноса</th><th class="n">Долг, покрытый бумагами</th><th class="n">Требования и обязательства</th><th class="n">Плата за нехватку</th></tr></thead><tbody>
-        ${dates.map((d, i) => `<tr${d === lastDay ? ' class="tot"' : ''} data-d="${d}" style="cursor:pointer"><td>${ddmm(d)}</td><td class="n">${fmt(go[i])}</td><td class="n">${fmt(eq[i] ? go[i] / eq[i] * 100 : NaN, 1)}%</td><td class="n ${sign(cash[i])}">${fmt(cash[i])}</td><td class="n ${sign(t1[i])}">${fmt(t1[i])}</td><td class="n">${repoVol[i] ? fmt(repoVol[i]) : ''}</td><td class="n ${repoCost[i] ? 'neg' : ''}">${repoCost[i] ? fmt(repoCost[i], 2) : ''}</td><td class="n">${fmt(debt[i])}</td><td class="n">${fmt(recv[i])}</td><td class="n ${fees[i] ? 'neg' : ''}">${fees[i] ? fmt(fees[i], 2) : ''}</td></tr>`).reverse().join('')}
+        ${dates.map((d, i) => `<tr${d === lastDay ? ' class="tot"' : ''} data-d="${d}" style="cursor:pointer"><td>${ddmm(d)}</td><td class="n">${fmt(go[i])}</td><td class="n">${fmt(eq[i] ? go[i] / eq[i] * 100 : NaN, 1)}%</td><td class="n ${sign(cash[i])}">${fmt(cash[i])}</td><td class="n ${sign(t1[i])}">${fmt(t1[i])}</td><td class="n">${repoVol[i] ? fmt(repoVol[i]) : ''}</td><td class="n ${repoCost[i] ? 'neg' : ''}">${repoCost[i] ? fmtCost(repoCost[i], 2) : ''}</td><td class="n">${fmt(debt[i])}</td><td class="n">${fmt(recv[i])}</td><td class="n ${fees[i] ? 'neg' : ''}">${fees[i] ? fmtCost(fees[i], 2) : ''}</td></tr>`).reverse().join('')}
     </tbody></table></div>`;
   el.querySelectorAll('tr[data-d]').forEach(tr => tr.onclick = () => { state.marginDay = tr.dataset.d; render(); document.querySelector('.posgrid')?.previousElementSibling?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
   const labels = dates.map(d => periodLabel(d, 'day'));
@@ -1100,7 +1166,7 @@ V.margin = (el, sel) => {
     { label: 'ГО', data: go, borderColor: css('--c4'), backgroundColor: css('--c4'), pointRadius: 0, borderWidth: 2, fill: false },
     { label: 'Стоимость счёта', data: eq, borderColor: css('--c1'), pointRadius: 0, borderWidth: 2 },
     { label: 'Деньги', data: cash, borderColor: css('--c3'), pointRadius: 0, borderWidth: 1.5 } ] } });
-  chart(document.getElementById('cGoFee'), { type: 'bar', options: baseOpts(false), data: { labels, datasets: [{ label: 'Плата за нехватку ГО', data: fees, backgroundColor: css('--loss') }] } });
+  chart(document.getElementById('cGoFee'), { type: 'bar', options: baseOpts(false), data: { labels, datasets: [{ label: 'Плата за нехватку ГО', data: fees.map(v => -v), backgroundColor: css('--loss') }] } });
 };
 
 V.data = (el) => {
@@ -1226,7 +1292,7 @@ async function loadFiles(files) {
     await DB.put(res.report); ok++;
   }
   await reload();
-  if (await loadIssSwap()) M = model();
+  const ch1 = await loadIssSwap(), ch2 = await loadIssBonds(); if (ch1 || ch2) M = model();
   state.lastLoad = { ok, total: files.length, replaced: state.replaced };
   state.tab = state.errors.length || !ok ? 'data' : 'summary'; render();
 }
@@ -1329,7 +1395,7 @@ document.getElementById('fAcc').onchange = e => { state.acc = e.target.value; re
 document.getElementById('fFrom').onchange = e => { state.from = e.target.value; render(); };
 document.getElementById('fTo').onchange = e => { state.to = e.target.value; render(); };
 if (window.Chart) { Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif"; }
-reload().then(() => { render(); return loadIssSwap(); }).then(ch => { if (ch) { M = model(); render(); } }).catch(err => { document.getElementById('view').innerHTML = `<div class="empty">Не удалось открыть хранилище браузера: ${err}</div>`; });
+reload().then(() => { render(); return Promise.all([loadIssSwap(), loadIssBonds()]); }).then(ch => { if (ch.some(Boolean)) { M = model(); render(); } }).catch(err => { document.getElementById('view').innerHTML = `<div class="empty">Не удалось открыть хранилище браузера: ${err}</div>`; });
 </script>
 </body>
 </html>
