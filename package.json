@@ -1,0 +1,21 @@
+{
+  "name": "finam-broker-analytics",
+  "version": "1.0.0",
+  "description": "Брокерская аналитика по справкам ФИНАМ — затраты, прибыль, ГО, фандинг. Работает в браузере, файлы никуда не отправляются.",
+  "scripts": {
+    "build": "node build.js",
+    "check": "node build.js --check"
+  },
+  "author": "Дмитрий Овчинников (https://t.me/Dmitrii_Ovchinnikov)",
+  "license": "CC-BY-NC-ND-4.0",
+  "type": "commonjs",
+  "devDependencies": {
+    "terser": "^5.51.2"
+  },
+  "private": true,
+  "homepage": "https://github.com/DmitriiOvchinnikov/finam-broker-analytics",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DmitriiOvchinnikov/finam-broker-analytics.git"
+  }
+}
