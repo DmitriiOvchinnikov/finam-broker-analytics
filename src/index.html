@@ -5,7 +5,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Брокерская аналитика ФИНАМ</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha512-CQBWl4fJHWbryGE+Pc7UAxWMUMNMWzWxF4SQo9CgkJIN1kx6djDQZjh3Y8SZ1d+6I+1zze6Z7kHXO7q3UyZAWw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
 :root {
@@ -146,11 +146,13 @@ footer a { color: var(--dim); }
 
 // Меняйте при любом изменении того, что разборщик достаёт из справки: старые разборы в браузере
 // пересчитать нельзя (исходные файлы не хранятся), страница попросит загрузить их заново.
-const PARSER_VERSION = 7;
+const PARSER_VERSION = 8;
 const DATE_RE = /^\d\d\.\d\d\.\d{4}$/;
 function num(x) {
   if (!x) return 0;
-  const v = parseFloat(String(x).replace(/[\s ]/g, '').replace(',', '.'));
+  let s = String(x).replace(/[\s\u00A0]/g, '').replace(/[−–—]/g, '-').replace(',', '.');
+  if (/^\((.*)\)$/.test(s)) s = '-' + s.slice(1, -1);
+  const v = parseFloat(s);
   return isFinite(v) ? v : 0;
 }
 function iso(d) { const m = /(\d\d)\.(\d\d)\.(\d{4})/.exec(d || ''); return m ? `${m[3]}-${m[2]}-${m[1]}` : ''; }
@@ -218,8 +220,11 @@ function parseReport(s) {
               positions: {}, holdings: {}, planned: {}, nontrade: [], tradeComm: 0,
               exchPaid: 0, exchPending: 0, penalty: 0, tax: 0, carry: 0, repoDiff: 0, otherIncome: 0,
               futByPay: {}, secTrades: {}, hasTrades: false, credits: [], moves: [],
-              commFut: null, commSec: null, commRepo: null, repoNeed: 0, repoVolume: 0 };
-  if (r.date !== r.dateTo) reject('MULTI', `${per[1]} – ${per[2]}`);
+              commFut: null, commSec: null, commRepo: null, repoNeed: 0, repoVolume: 0,
+              dated: {}, futNet: {}, isPeriod: false, futDeals: {} };
+  // справка за период: оценка счёта, деньги, ГО, позиции — только на начало и конец; затраты и сделки — по датам
+  r.isPeriod = r.date !== r.dateTo;
+  const D = d => r.dated[d] || (r.dated[d] = { tradeComm: 0, exchPaid: 0, commFut: 0, commSec: 0, commRepo: 0, repoNeed: 0, repoVolume: 0, repoDiff: 0, penalty: 0 });
 
   const S = { 'Оценка рублевой позиции': 'cash', 'Оценка валютной позиции': 'fx', 'Оценка позиции по немаржируемым': 'nonMarg',
               'Оценка позиции по ПФИ': 'go', 'Оценка позиции по ценным бумагам': 'sec', 'Оценка позиции по драгоценным': 'metals',
@@ -241,7 +246,7 @@ function parseReport(s) {
   // позиции по ПФИ: 7 ВМ факт (оплачена сегодня), 8 ВМ план (за этот торговый день), 10 позиция на конец
   for (const c of rows(section(s, 'Оценка позиции по Производным', ['ГО срочного рынка', 'Оценка позиции по ценным']))) {
     if (c.length >= 11 && c[1] && c[0].startsWith(c[1] + ','))
-      r.positions[c[1]] = { pos: num(c[10]), vm: num(c[8]), kind: c[0].split(',')[1]?.trim() || '' };
+      r.positions[c[1]] = { pos: num(c[10]), pos0: num(c[2]), vm: num(c[8]), fact: num(c[7]), kind: c[0].split(',')[1]?.trim() || '' };
   }
   for (const c of rows(section(s, 'Оценка позиции по ценным бумагам и иностранным', ['Оценка обязательств по незавершенным', '2. Движения']))) {
     // 3 кол-во на начало, 5 оценка на начало (с НКД), 8 кол-во на конец, 10 оценка на конец (с НКД)
@@ -258,16 +263,16 @@ function parseReport(s) {
   for (const c of rows(section(s, '2. Движения по счету', ['Торговые движения']))) {
     if (c[0].includes('(итого)')) continue;
     if (DATE_RE.test(c[0]) && c.length >= 7) {           // неторговые операции, построчный формат
-      const debit = num(c[5]), credit = num(c[4]), comment = c[c.length - 1];
+      const debit = num(c[5]), credit = num(c[4]), comment = c[c.length - 1], date = iso(c[0]);
       // ввод, вывод и переводы — движения денег, не затраты и не доход; налог учитывается отдельно
       if (/Ввод ДС|Вывод ДС|Перевод ДС/i.test(c[1]) || (/Зачисление ДС/i.test(c[1]) && !/процент|купон|дивиденд/i.test(comment))) {
         const acc2 = (/Сч[её]т (?:списания|зачисления):\s*(\S+)/.exec(comment) || [])[1] || '';
-        r.moves.push({ type: c[1], amount: credit - debit, comment, kind: /Перевод/i.test(c[1]) ? 'transfer' : 'external', account2: acc2 });
+        r.moves.push({ type: c[1], amount: credit - debit, comment, kind: /Перевод/i.test(c[1]) ? 'transfer' : 'external', account2: acc2, date });
         continue;
       }
       if (debit && /налог|ндфл/i.test(c[1])) r.tax += debit;
-      else if (debit && !/Вывод|Перевод|Списание ДС|Возврат/i.test(c[1])) r.nontrade.push({ type: c[1], amount: debit, comment, cls: classify(c[1], comment) });
-      else if (credit) r.credits.push({ type: c[1], amount: credit, comment, cls: creditClass(c[1], comment), instr: c[2] || '' });
+      else if (debit && !/Вывод|Перевод|Списание ДС|Возврат/i.test(c[1])) r.nontrade.push({ type: c[1], amount: debit, comment, cls: classify(c[1], comment), date });
+      else if (credit) r.credits.push({ type: c[1], amount: credit, comment, cls: creditClass(c[1], comment), instr: c[2] || '', date });
       continue;
     }
     if (c[0] === 'Комиссия брокерская' && c.length >= 4 && c[2] === '' && num(c[3])) {   // сводный формат, без расшифровки
@@ -277,27 +282,31 @@ function parseReport(s) {
     if (c.length >= 4 && num(c[2]) && !num(c[3]) && /купон|дивиденд|погашен|зачислен/i.test(c[0])) {   // сводный формат, зачисления
       r.credits.push({ type: c[0], amount: num(c[2]), comment: c[c.length - 1] || '', cls: creditClass(c[0], c[c.length - 1]), instr: '' }); continue;
     }
-    if (c[0] === 'Комиссия брокерская') { r.tradeComm += num(c[2]); continue; }
-    if (c[0] === 'Биржевые затраты') { if (c[3]) r.exchPaid += num(c[2]); else r.exchPending += num(c[2]); continue; }
+    if (c[0] === 'Комиссия брокерская') { r.tradeComm += num(c[2]); if (DATE_RE.test(c[3])) D(iso(c[3])).tradeComm += num(c[2]); continue; }
+    if (c[0] === 'Биржевые затраты') { if (c[3]) { r.exchPaid += num(c[2]); if (DATE_RE.test(c[3])) D(iso(c[3])).exchPaid += num(c[2]); } else r.exchPending += num(c[2]); continue; }
     if (c[0].startsWith('Расходы по сделкам переноса')) { r.carry += num(c[2]); continue; }
 
   }
   for (const c of rows(section(s, 'Разность переноса РЕПО', []))) {
     if (c[0].startsWith('Итого (разность переноса)')) { const v = c.filter(x => x !== '').pop(); r.repoDiff += num(v); }
-    // «Дата: … Сумма: −X» — сколько денег не хватало на расчёты (остаток на Т+1 вчерашней справки), 7 — сумма 1-й части
-    else if (c[0] === 'Дата:' && c.length >= 4) r.repoNeed += num(c[3]);
-    else if (/^(Продажа|Покупка) \(РЕПО\)/.test(c[0]) && c.length >= 8) r.repoVolume += num(c[7]);
+    // «Дата: … Сумма: −X» — сколько денег не хватало на расчёты (остаток на Т+1 вчерашней справки), 7 — сумма 1-й части,
+    // 1 — дата сделки, 12 — разница переноса по сделке
+    else if (c[0] === 'Дата:' && c.length >= 4) { r.repoNeed += num(c[3]); if (DATE_RE.test(c[1])) D(iso(c[1])).repoNeed += num(c[3]); }
+    else if (/^(Продажа|Покупка) \(РЕПО\)/.test(c[0]) && c.length >= 8) {
+      r.repoVolume += num(c[7]);
+      if (DATE_RE.test(c[1])) { D(iso(c[1])).repoVolume += num(c[7]); D(iso(c[1])).repoDiff += num(c[12]); }
+    }
   }
   // Итоговые строки «Комиссия брокерская» внутри таблиц сделок — комиссия по рынкам за день.
   // ФР + ФОРТС = «Комиссия брокерская» в «Комиссиях за торговые операции»; РЕПО входит в «Расходы по сделкам переноса».
   const commRow = c => c.slice(0, 6).includes('Комиссия брокерская') ? (c.slice(5).map(num).find(v => v) || 0) : null;
-  const sumComm = (start, stops) => { let t = null; for (const c of rows(section(s, start, stops))) { const v = commRow(c); if (v !== null) t = (t || 0) + v; } return t; };
+  const sumComm = (start, stops, key) => { let t = null; for (const c of rows(section(s, start, stops))) { const v = commRow(c); if (v !== null) { t = (t || 0) + v; if (DATE_RE.test(c[0])) D(iso(c[0]))[key] += v; } } return t; };
   if (/Торговые движения/.test(s)) {
-    r.commSec = sumComm('Торговые движения ценных бумаг', ['Торговые движения ПФИ', 'Сделки РЕПО', 'Разность переноса РЕПО']) || 0;
-    r.commFut = sumComm('Торговые движения ПФИ', ['Сделки РЕПО', 'Разность переноса РЕПО']) || 0;
-    r.commRepo = sumComm('Сделки РЕПО', ['Разность переноса РЕПО']) || 0;
+    r.commSec = sumComm('Торговые движения ценных бумаг', ['Торговые движения ПФИ', 'Сделки РЕПО', 'Разность переноса РЕПО'], 'commSec') || 0;
+    r.commFut = sumComm('Торговые движения ПФИ', ['Сделки РЕПО', 'Разность переноса РЕПО'], 'commFut') || 0;
+    r.commRepo = sumComm('Сделки РЕПО', ['Разность переноса РЕПО'], 'commRepo') || 0;
   }
-  for (const n of r.nontrade) if (n.cls === 'penalty') { r.penalty += n.amount; }
+  for (const n of r.nontrade) if (n.cls === 'penalty') { r.penalty += n.amount; if (n.date) D(n.date).penalty += n.amount; }
   r.nontrade = r.nontrade.filter(n => n.cls !== 'penalty');
 
   // сделки фондового рынка: 0 дата, 2 бумага, 4 вид, 5 кол-во, 9 сумма, 22 режим, 25 № сделки, 26 описание
@@ -317,6 +326,11 @@ function parseReport(s) {
     const qty = num(c[5]), fee = num(c[9]) + num(c[12]), price = num(c[6]), side = /Покупка/.test(c[4]) ? 1 : -1;
     a.lots += qty; a.fills++; a.fee += fee; a.turn += Math.abs(num(c[18]));
     if (fee) { a.feeFills++; a.feeLots += qty; }
+    const nd = r.futNet[iso(c[0])] || (r.futNet[iso(c[0])] = {}); nd[c[3]] = (nd[c[3]] || 0) + side * qty;
+    const f0 = /фандинг\s*(-?[\d.]+)/i.exec(c[24] || '');
+    // дата оплаты, контракт, кол-во, сбор (оплачен или в долге), сумма, «фандинг» из комментария, сторона, ₽ за пункт на лот
+    r.futDeals[c[23] || [pay, c[3], c[1], qty, c[6]].join('|')] = [pay, c[3], qty, fee, Math.abs(num(c[18])), f0 ? parseFloat(f0[1]) : null, side,
+      price && qty && num(c[18]) ? Math.abs(num(c[18])) / (price * qty) : 0];
     if (price && qty && num(c[18])) a.k = Math.abs(num(c[18])) / (price * qty);          // рублей за пункт цены на лот
     // «в т.ч. фандинг» по сделке: ставка × лот × кол-во, со знаком «+» для покупки (знак обратен денежному)
     const f = /фандинг\s*(-?[\d.]+)/i.exec(c[24] || '');
@@ -358,7 +372,8 @@ const DB = {
       t.oncomplete = () => res(out && out.result !== undefined ? out.result : undefined); t.onerror = () => rej(t.error);
     });
   },
-  put(r) { return this.tx('readwrite', st => st.put(r, r.account + '|' + r.date)); },
+  key: r => r.account + '|' + r.date + (r.dateTo && r.dateTo !== r.date ? '..' + r.dateTo : ''),
+  put(r) { return this.tx('readwrite', st => st.put(r, this.key(r))); },
   all() { return this.tx('readonly', st => st.getAll()); },
   del(key) { return this.tx('readwrite', st => st.delete(key)); },
   clear() { return this.tx('readwrite', st => st.clear()); },
@@ -397,28 +412,69 @@ function periodLabel(k, g) {
 /* ---------- модель: из справок в дневные ряды по счёту ---------- */
 // торговый день для даты оплаты: ближайший будний день раньше неё (сделки выходных относятся к понедельнику)
 function tradeDayOf(pay, reportDates) {
+  // клиринг сделки — предыдущий будний день перед оплатой; если он позже последней справки (сделки выходных после
+  // конца данных), относим к нему — за пределы выборки, а не к пятнице
+  let p = addDays(pay, -1); while (weekday(p) % 6 === 0) p = addDays(p, -1);
+  if (reportDates.maxDate && p > reportDates.maxDate) return p;
   let d = addDays(pay, -1);
   for (let i = 0; i < 10; i++, d = addDays(d, -1)) if (weekday(d) % 6 !== 0 && reportDates.has(d)) return d;
   d = addDays(pay, -1); while (weekday(d) % 6 === 0) d = addDays(d, -1); return d;
 }
 // «Из суммы к выплате 1000.00 руб. удержан налог 130.00 руб.» — результат бумаги считаем до налога, налог показан отдельно
 function grossTax(c) { const m = /удержан налог\s*([\d\s.,]+)/i.exec(c.comment || ''); return m ? parseFloat(m[1].replace(/\s/g, '').replace(',', '.')) || 0 : 0; }
+// Справка за период разворачивается в дни. Что есть по датам (затраты, сделки, РЕПО, пени, купоны) — раскладывается
+// по своим дням; позиция на конец дня — позиция на начало периода + сделки по датам. Стоимость счёта, деньги и ГО
+// известны только на начало и конец, поэтому прибыль за период стоит последним днём, а дни помечены «неполными».
+// последний будний (клиринговый) день строго до даты
+function lastClearingBefore(d) { let x = addDays(d, -1); while (weekday(x) % 6 === 0) x = addDays(x, -1); return x; }
+function expandPeriod(r) {
+  const out = [], pos = {}; for (const c in r.positions) pos[c] = r.positions[c].pos0;
+  // позиция на начало периода — на последнем клиринге; сделки выходных перед периодом войдут в позицию на первом клиринге
+  for (let d = addDays(lastClearingBefore(r.date), 1); d < r.date; d = addDays(d, 1))
+    for (const c in r.futNet[d] || {}) pos[c] = (pos[c] || 0) + r.futNet[d][c];
+  for (let d = r.date; d <= r.dateTo; d = addDays(d, 1)) {
+    const dt = r.dated[d] || {}, first = d === r.date, last = d === r.dateTo;
+    for (const c in r.futNet[d] || {}) pos[c] = (pos[c] || 0) + r.futNet[d][c];
+    const positions = {}; for (const c of new Set([...Object.keys(pos), ...Object.keys(r.positions)])) positions[c] = { pos: Math.round(pos[c] || 0), vm: 0 };
+    if (last) for (const c in r.positions) positions[c].pos = r.positions[c].pos;   // на конец — как в справке
+    const repoSplit = Math.abs(r.carry - r.commRepo - r.repoDiff) < 0.05;
+    out.push({ v: r.v, account: r.account, date: d, dateTo: d, partial: true, period: { from: r.date, to: r.dateTo, last, first },
+      summary: last ? { total: [r.summary.total?.[0], r.summary.total?.[1]], go: [NaN, r.summary.go?.[1]] } : first ? { total: [r.summary.total?.[0], NaN] } : {},
+      money: last ? r.money : {}, flows: last ? r.flows : {}, positions,
+      holdings: last ? r.holdings : {}, planned: last ? r.planned : {},
+      nontrade: r.nontrade.filter(n => n.date === d), credits: r.credits.filter(c => c.date === d), moves: r.moves.filter(m => m.date === d),
+      tradeComm: dt.tradeComm || 0, exchPaid: dt.exchPaid || 0, exchPending: 0, penalty: dt.penalty || 0, tax: last ? r.tax : 0,
+      carry: repoSplit ? (dt.commRepo || 0) + (dt.repoDiff || 0) : (last ? r.carry : 0),
+      repoDiff: dt.repoDiff || 0, commRepo: dt.commRepo || 0, commFut: dt.commFut || 0, commSec: dt.commSec || 0,
+      repoNeed: dt.repoNeed || 0, repoVolume: dt.repoVolume || 0,
+      futByPay: {}, futDeals: first ? r.futDeals : {}, secTrades: r.secTrades, hasTrades: true, otherIncome: 0, dated: {}, futNet: {},
+      periodVm: last ? r.positions : null });
+  }
+  return out;
+}
 function buildAccount(reps) {
   reps.sort((a, b) => a.date.localeCompare(b.date));
-  const dates = new Set(reps.map(r => r.date));
-  // сделки ПФИ: по каждой дате оплаты берём справку за эту дату, иначе самую позднюю
-  const best = {};
-  for (const r of reps) for (const pay in r.futByPay) {
-    const cur = best[pay];
-    if (!cur || (r.date === pay) || (cur.date !== pay && r.date > cur.date)) best[pay] = { date: r.date, data: r.futByPay[pay] };
-  }
+  const dates = new Set(reps.map(r => r.date)); dates.maxDate = reps.length ? reps.at(-1).date : '';
+  // сделки ПФИ: одна и та же сделка есть в справке за свой день и за день оплаты — склеиваем по номеру сделки;
+  // сбор берём из любой копии (в одной он оплачен, в другой ещё в долге)
+  const deals = {};
+  for (const r of reps) for (const id in r.futDeals || {}) { const x = r.futDeals[id]; if (!deals[id] || (!deals[id][3] && x[3])) deals[id] = x; }
   const futByDay = {};
-  for (const pay in best) {
-    const td = tradeDayOf(pay, dates); const tgt = futByDay[td] || (futByDay[td] = {});
-    for (const code in best[pay].data) {
-      const a = best[pay].data[code], t = tgt[code] || (tgt[code] = { lots: 0, fills: 0, fee: 0, feeFills: 0, feeLots: 0, turn: 0, funding: 0 });
-      for (const k in a) if (k === 'fundRate' || k === 'k') t[k] = a[k]; else t[k] += a[k];
-    }
+  for (const id in deals) {
+    const [pay, code, qty, fee, turn, fund, side, k] = deals[id];
+    const td = tradeDayOf(pay, dates), tgt = futByDay[td] || (futByDay[td] = {});
+    const t = tgt[code] || (tgt[code] = { lots: 0, fills: 0, fee: 0, feeFills: 0, feeLots: 0, turn: 0, funding: 0 });
+    t.lots += qty; t.fills++; t.fee += fee; t.turn += turn; if (fee) { t.feeFills++; t.feeLots += qty; }
+    if (fund !== null) { t.funding += fund; if (qty) t.fundRate = fund / qty * side; }
+    if (k) t.k = k;
+  }
+  // старые разборы без отдельных сделок (на всякий случай): сводка по дате оплаты из справки за эту дату
+  if (!Object.keys(deals).length) {
+    const best = {};
+    for (const r of reps) for (const pay in r.futByPay) { const cur = best[pay]; if (!cur || r.date === pay || (cur.date !== pay && r.date > cur.date)) best[pay] = { date: r.date, data: r.futByPay[pay] }; }
+    for (const pay in best) { const td = tradeDayOf(pay, dates), tgt = futByDay[td] || (futByDay[td] = {});
+      for (const code in best[pay].data) { const a = best[pay].data[code], t = tgt[code] || (tgt[code] = { lots: 0, fills: 0, fee: 0, feeFills: 0, feeLots: 0, turn: 0, funding: 0 });
+        for (const kk in a) if (kk === 'fundRate' || kk === 'k') t[kk] = a[kk]; else t[kk] += a[kk]; } }
   }
   const secByDay = {}, secFlow = {}; const seenSec = new Set();
   for (const r of reps) for (const id in r.secTrades) {
@@ -433,13 +489,13 @@ function buildAccount(reps) {
     const fut = futByDay[r.date] || {};
     let lots = 0, exchTrades = 0; for (const c in fut) { lots += fut[c].lots; exchTrades += fut[c].fee; }
     // «начислено» = долг на конец дня − (долг вчера − оплачено сегодня); без справки за вчера долг на начало неизвестен
-    const hasPrev = prevDate === addDays(r.date, -1);
+    const hasPrev = prevDate === addDays(r.date, -1) && !r.partial;
     const exchAccr = hasPrev ? r.exchPending - (prevPending - r.exchPaid) : NaN;
     prevPending = r.exchPending; prevDate = r.date;
     const d = { date: r.date, r, fut, sec: secByDay[r.date] || { shares: 0, bonds: 0, funds: 0 }, lots,
                 exch: r.hasTrades || Object.keys(fut).length ? exchTrades : (isFinite(exchAccr) ? Math.max(0, exchAccr) : 0),
-                equity: r.summary.total?.[1] ?? 0, equityStart: r.summary.total?.[0] ?? 0,
-                go: r.summary.go?.[1] ?? 0, flowsIn: (r.flows.deposit || 0) - (r.flows.withdraw || 0),
+                equity: r.summary.total?.[1] ?? (r.partial ? NaN : 0), equityStart: r.summary.total?.[0] ?? (r.partial ? NaN : 0),
+                go: r.summary.go?.[1] ?? (r.partial ? NaN : 0), partial: !!r.partial, flowsIn: (r.flows.deposit || 0) - (r.flows.withdraw || 0),
                 deposit: r.flows.deposit || 0, withdraw: r.flows.withdraw || 0, tax: Math.abs(r.flows.tax || 0) || r.tax || 0,
                 income: { coupon: 0, dividend: 0, lending: 0, otherIncome: 0, redemption: 0, flowsIncome: r.flows.income || 0 },
                 transfers: (r.moves || []).filter(m => m.kind === 'transfer').reduce((a, m) => a + m.amount, 0),
@@ -450,10 +506,16 @@ function buildAccount(reps) {
     d.vmByCode = {};
     if (d.clearing) for (const c in r.positions) { d.vmByCode[c] = r.positions[c].vm; d.vm += r.positions[c].vm; }
     d.pnl = d.equity - d.equityStart - d.flowsIn;
+    if (!isFinite(d.pnl)) d.pnl = 0;              // неполный день справки за период: прибыль стоит последним днём
     for (const k of COST_KEYS) d.costs[k[0]] = 0;
     d.costs.exch = d.exch;
     // общие «Биржевые затраты» дня (начислено) минус сбор по сделкам с фьючерсами = фондовый рынок
-    const exchSec = isFinite(exchAccr) && (r.hasTrades || Object.keys(fut).length) ? exchAccr - exchTrades : 0;
+    let exchSec = isFinite(exchAccr) && (r.hasTrades || Object.keys(fut).length) ? exchAccr - exchTrades : 0;
+    if (r.partial && weekday(r.date) % 6 !== 0) {
+      let nx = addDays(r.date, 1); while (weekday(nx) % 6 === 0) nx = addDays(nx, 1);
+      const paidNext = nx <= r.period.to ? (reps.find(x => x.partial && x.date === nx)?.exchPaid || 0) : (r.period.last ? NaN : NaN);
+      exchSec = isFinite(paidNext) ? paidNext - exchTrades : 0;
+    }
     d.costs.exchSec = exchSec > 1 ? exchSec : 0;
     // «Расходы по сделкам переноса» = комиссия по сделкам РЕПО + разность переноса; раскладываем, если сходится
     const repoSplit = r.commRepo !== null && r.commRepo !== undefined && Math.abs(r.carry - r.commRepo - r.repoDiff) < 0.05;
@@ -481,16 +543,31 @@ function buildAccount(reps) {
     }
   }
   days.perp = perp;
+  // Маржа за период по контракту = оплаченная за период («факт») + неоплаченная на конец («план») − маржа дня перед
+  // периодом (оплачена в первый день). Её берём из однодневной справки за последний торговый день перед периодом
+  // (в справке за выходной «план» повторяет пятничный не по всем контрактам); нет её — 0 и предупреждение.
+  for (const d of days) {
+    if (!d.r.periodVm) continue;
+    const before = days.find(x => !x.partial && x.date === lastClearingBefore(d.r.period.from));
+    d.vmApprox = !before; d.vm = 0; d.vmByCode = {};
+    for (const c in d.r.periodVm) { const v = d.r.periodVm[c]; const x = before?.r.positions[c]?.vm || 0; d.vmByCode[c] = v.fact + v.vm - x; d.vm += d.vmByCode[c]; }
+  }
   // Фондовый рынок, по бумагам: результат дня = стоимость на конец − на начало (с НКД, вместе с плановыми позициями:
   // купленное до поставки, проданное до списания, выданное в заём и в РЕПО) − купили + продали + купоны/дивиденды по бумаге.
   for (const d of days) {
-    const r = d.r, names = new Set([...Object.keys(r.holdings), ...Object.keys(r.planned), ...Object.keys(secFlow[d.date] || {})]);
     d.paper = {}; d.paperTotal = 0;
+    if (d.partial && !d.r.period.last) continue;       // по справке за период — результат бумаг за весь период последним днём
+    const r = d.r;
+    // сделки и купоны: за день, а для справки за период — за все её дни
+    const flowDates = d.partial ? Object.keys(secFlow).filter(x => x >= r.period.from && x <= r.period.to) : [d.date];
+    const flow = {}; for (const fd of flowDates) for (const n in secFlow[fd] || {}) { const t = flow[n] || (flow[n] = { buy: 0, sell: 0 }); t.buy += secFlow[fd][n].buy; t.sell += secFlow[fd][n].sell; }
+    const credits = d.partial ? days.filter(x => x.partial && x.date >= r.period.from && x.date <= r.period.to).flatMap(x => x.r.credits || []) : (r.credits || []);
+    const names = new Set([...Object.keys(r.holdings), ...Object.keys(r.planned), ...Object.keys(flow)]);
     for (const n of names) {
-      const h = r.holdings[n] || {}, pl = r.planned[n] || {}, f = secFlow[d.date]?.[n] || { buy: 0, sell: 0 };
+      const h = r.holdings[n] || {}, pl = r.planned[n] || {}, f = flow[n] || { buy: 0, sell: 0 };
       const v1 = (h.val || 0) + (pl.val || 0), v0 = (h.val0 || 0) + (pl.val0 || 0);
       const isin = h.isin || pl.isin || '';
-      const income = (r.credits || []).filter(c => (c.cls === 'coupon' || c.cls === 'dividend' || c.cls === 'redemption') &&
+      const income = credits.filter(c => (c.cls === 'coupon' || c.cls === 'dividend' || c.cls === 'redemption') &&
           ((isin && (c.comment || '').includes(isin)) || (c.instr && (c.instr === n || c.instr.includes(n)))))
         .reduce((a, c) => a + c.amount + grossTax(c), 0);
       const pnl = v1 - v0 - f.buy + f.sell + income;
@@ -503,7 +580,7 @@ function buildAccount(reps) {
   for (let i = 0; i < days.length; i++) {
     const d = days[i], prev = days[i - 1];
     d.gapDays = prev ? Math.round((Date.parse(d.date) - Date.parse(prev.date)) / 864e5) - 1 : 0;
-    d.gapPnl = d.gapDays > 0 ? d.equityStart - prev.equity : 0;
+    d.gapPnl = d.gapDays > 0 && isFinite(d.equityStart) && isFinite(prev.equity) ? d.equityStart - prev.equity : 0;
   }
   // ежемесячную плату относим к концу оплаченного периода
   for (const d of days) for (const n of d.r.nontrade) {
@@ -566,15 +643,20 @@ function deriveRates(days) {
 }
 function nnls(X, y, k) {
   const w = new Array(k).fill(0); if (!X.length) return w;
-    for (let it = 0; it < 20000; it++) {
+  for (let it = 0; it < 2000; it++) {
+    let maxDelta = 0;
     for (let j = 0; j < k; j++) {
       let num_ = 0, den = 0;
       for (let i = 0; i < X.length; i++) {
         let pred = 0; for (let t = 0; t < k; t++) if (t !== j) pred += w[t] * X[i][t];
         num_ += X[i][j] * (y[i] - pred); den += X[i][j] * X[i][j];
       }
-      w[j] = den > 0 ? Math.max(0, num_ / den) : 0;
+      const newW = den > 0 ? Math.max(0, num_ / den) : 0;
+      const delta = Math.abs(newW - w[j]);
+      if (delta > maxDelta) maxDelta = delta;
+      w[j] = newW;
     }
+    if (maxDelta < 1e-9) break;
   }
   return w;
 }
@@ -622,8 +704,17 @@ function model() {
   for (const r of state.reports) (byAcc[r.account] || (byAcc[r.account] = [])).push(r);
   const accs = Object.keys(byAcc).sort();
   const res = {};
+  state.periodWarn = [];
   for (const a of accs) {
-    const days = buildAccount(byAcc[a]); const rates = deriveRates(days); applyRates(days, rates);
+    const daily = byAcc[a].filter(r => r.date === r.dateTo), dset = new Set(daily.map(r => r.date)), used = [];
+    for (const r of byAcc[a].filter(r => r.date !== r.dateTo).sort((x, y) => x.date.localeCompare(y.date))) {
+      let clash = '';
+      for (let d = r.date; d <= r.dateTo; d = addDays(d, 1)) if (dset.has(d)) { clash = 'пересекается с однодневной справкой за ' + ddmm(d); break; }
+      if (!clash) for (const u of used) if (!(r.dateTo < u.date || r.date > u.dateTo)) clash = `пересекается со справкой за ${ddmm(u.date)}–${ddmm(u.dateTo)}`;
+      if (clash) { state.periodWarn.push(`Справка за ${ddmm(r.date)}–${ddmm(r.dateTo)} по счёту ${a} не используется: ${clash}. Удалите лишнее на вкладке «Данные».`); continue; }
+      used.push(r);
+    }
+    const days = buildAccount([...daily, ...used.flatMap(expandPeriod)]); const rates = deriveRates(days); applyRates(days, rates);
     res[a] = { days, rates };
   }
   return { accs, res };
@@ -694,12 +785,12 @@ function totals(sel) {
     t.deposit += d.deposit; t.withdraw += d.withdraw; t.tax += d.tax; t.funding += dayFunding(d);
     t.transfers = (t.transfers || 0) + d.transfers; t.external = (t.external || 0) + d.external;
     for (const k of COST_KEYS) t.byCost[k[0]] += d.costs[k[0]] || 0;
-    lastEq[s.acc] = d.equity; if (!(s.acc in firstEq)) firstEq[s.acc] = d.equityStart;
+    if (isFinite(d.equity)) lastEq[s.acc] = d.equity; if (!(s.acc in firstEq) && isFinite(d.equityStart)) firstEq[s.acc] = d.equityStart;
   }
   const allDates = [...new Set(sel.flatMap(s => s.days.map(d => d.date)))].sort();
   t.days = allDates.length; t.calDays = allDates.length ? (Date.parse(allDates.at(-1)) - Date.parse(allDates[0])) / 864e5 + 1 : 0;
   t.equity = Object.values(lastEq).reduce((a, b) => a + b, 0); t.equity0 = Object.values(firstEq).reduce((a, b) => a + b, 0);
-  const eqByDate = {}; for (const s of sel) for (const d of s.days) eqByDate[d.date] = (eqByDate[d.date] || 0) + d.equity;
+  const eqByDate = {}; for (const s of sel) for (const d of s.days) if (isFinite(d.equity)) eqByDate[d.date] = (eqByDate[d.date] || 0) + d.equity;
   const eqs = Object.values(eqByDate); t.avgEq = eqs.length ? eqs.reduce((a, b) => a + b, 0) / eqs.length : 0;
   t.from = allDates[0]; t.to = allDates.at(-1);
   // прибыль = срочный рынок (ВМ) + фондовый рынок и прочее − затраты − налоги; «фондовый и прочее» — остаток
@@ -801,12 +892,12 @@ V.costs = (el, sel) => {
     <p class="note">Купоны, дивиденды и прочие зачисления из неторговых операций справки; «Дивиденды / НКД» — одноимённая колонка движений денег (в ней же НКД, уплаченный и полученный при сделках с облигациями). Погашение номинала показано отдельно и доходом не считается: это возврат вложенных денег. Все эти суммы уже входят в прибыль через стоимость счёта.</p>
     <div class="tbl"><table><thead><tr><th>Счёт</th><th>Дата</th><th>Вид</th><th>Бумага</th><th class="n">Сумма, ₽</th><th>Комментарий брокера</th></tr></thead><tbody>
       ${sel.flatMap(s => s.days.flatMap(d => [
-          ...(d.r.credits || []).filter(c => c.cls !== 'deposit').map(c => `<tr><td>${s.acc}</td><td>${d.date}</td><td>${{ coupon: 'Купон', dividend: 'Дивиденды', lending: 'Проценты по займу бумаг', redemption: 'Погашение номинала', otherIncome: c.type }[c.cls] || c.type}</td><td>${c.instr}</td><td class="n">${fmt(c.amount, 2)}</td><td>${c.comment}</td></tr>`),
-          ...(d.income.flowsIncome ? [`<tr><td>${s.acc}</td><td>${d.date}</td><td>Дивиденды / НКД (движения)</td><td></td><td class="n ${sign(d.income.flowsIncome)}">${fmt(d.income.flowsIncome, 2)}</td><td></td></tr>`] : [])])).join('')
+          ...(d.r.credits || []).filter(c => c.cls !== 'deposit').map(c => `<tr><td>${esc(s.acc)}</td><td>${d.date}</td><td>${esc({ coupon: 'Купон', dividend: 'Дивиденды', lending: 'Проценты по займу бумаг', redemption: 'Погашение номинала', otherIncome: c.type }[c.cls] || c.type)}</td><td>${esc(c.instr)}</td><td class="n">${fmt(c.amount, 2)}</td><td>${esc(c.comment)}</td></tr>`),
+          ...(d.income.flowsIncome ? [`<tr><td>${esc(s.acc)}</td><td>${d.date}</td><td>Дивиденды / НКД (движения)</td><td></td><td class="n ${sign(d.income.flowsIncome)}">${fmt(d.income.flowsIncome, 2)}</td><td></td></tr>`] : [])])).join('')
         || '<tr><td colspan="6">В загруженных справках купонов и дивидендов нет. Загрузите справки за дни выплат.</td></tr>'}
     </tbody></table></div>
     <h2>Неторговые списания брокера</h2><div class="tbl"><table><thead><tr><th>Счёт</th><th>Дата</th><th>Статья</th><th class="n">Сумма, ₽</th><th>Комментарий брокера</th></tr></thead><tbody>
-      ${sel.flatMap(s => s.days.flatMap(d => d.r.nontrade.map(n => `<tr><td>${s.acc}</td><td>${d.date}</td><td>${(COST_KEYS.find(k => k[0] === n.cls) || [, n.type])[1]}</td><td class="n">${fmt(n.amount, 2)}</td><td>${n.comment || '<span class="warn">без расшифровки (краткий формат справки)</span>'}</td></tr>`))).join('') || '<tr><td colspan="5">нет</td></tr>'}
+      ${sel.flatMap(s => s.days.flatMap(d => d.r.nontrade.map(n => `<tr><td>${esc(s.acc)}</td><td>${d.date}</td><td>${esc((COST_KEYS.find(k => k[0] === n.cls) || [, n.type])[1])}</td><td class="n">${fmt(n.amount, 2)}</td><td>${n.comment ? esc(n.comment) : '<span class="warn">без расшифровки (краткий формат справки)</span>'}</td></tr>`))).join('') || '<tr><td colspan="5">нет</td></tr>'}
     </tbody></table></div>`;
   chart(document.getElementById('cCosts'), { type: 'bar', options: baseOpts(true), data: { labels: G.keys.map(k => periodLabel(k, state.group)),
     datasets: ks.map(k => ({ label: k[1], data: G.keys.map(p => G.P[p].costs[k[0]] || 0), backgroundColor: css(COLORS[COST_KEYS.indexOf(k)]) })) } });
@@ -821,7 +912,7 @@ V.rates = (el, sel) => {
     <h2>Периоды ставок</h2>
     <div class="tbl"><table><thead><tr><th>Счёт</th><th>Рынок</th><th>С</th><th>По</th><th class="n">Ставка</th><th class="n">Дней</th></tr></thead><tbody>
       ${sel.flatMap(s => [...s.rates.futSegs.map(g => [s.acc, 'срочный', g, fmt(g.rate, 4) + ' ₽ за контракт']), ...s.rates.stockSegs.map(g => [s.acc, 'фондовый', g, fmt(g.rate * 100, 4) + '%'])]
-        .map(([a, m, g, v]) => `<tr><td>${a}</td><td>${m}</td><td>${g.from}</td><td>${g.to}</td><td class="n">${v}</td><td class="n">${g.n}</td></tr>`)).join('') || '<tr><td colspan="6">нет данных</td></tr>'}
+        .map(([a, m, g, v]) => `<tr><td>${esc(a)}</td><td>${m}</td><td>${g.from}</td><td>${g.to}</td><td class="n">${v}</td><td class="n">${g.n}</td></tr>`)).join('') || '<tr><td colspan="6">нет данных</td></tr>'}
     </tbody></table></div>
     <div class="grid two">
       <div><h2>Срочный рынок: ₽ за контракт по дням</h2><div class="chart"><canvas id="cRate"></canvas></div></div>
@@ -829,7 +920,7 @@ V.rates = (el, sel) => {
     </div>
     <h2>Сверка по дням</h2>
     <div class="tbl"><table><thead><tr><th>Счёт</th><th>Дата</th><th class="n">Лотов</th><th class="n">Ставка, ₽ за контракт</th><th class="n">Ставка ФР</th><th class="n">Оборот акций и облигаций</th><th class="n">Оборот фондов</th><th class="n">Должен был взять</th><th class="n">Взял</th><th class="n">Разница</th></tr></thead><tbody>
-      ${rowsH.map(({ acc, d }) => `<tr><td>${acc}</td><td>${d.date}</td><td class="n">${fmt(d.lots)}</td><td class="n">${isFinite(d.futRate) ? fmt(d.futRate, 2) : '—'}</td><td class="n">${isFinite(d.stockRate) ? fmt(d.stockRate * 100, 4) + '%' : '—'}</td>
+      ${rowsH.map(({ acc, d }) => `<tr><td>${esc(acc)}</td><td>${d.date}</td><td class="n">${fmt(d.lots)}</td><td class="n">${isFinite(d.futRate) ? fmt(d.futRate, 2) : '—'}</td><td class="n">${isFinite(d.stockRate) ? fmt(d.stockRate * 100, 4) + '%' : '—'}</td>
         <td class="n">${fmt(d.sec.shares + d.sec.bonds)}</td><td class="n">${fmt(d.sec.funds)}</td>
         <td class="n">${fmt(d.expectedComm, 2)}</td><td class="n">${fmt(d.tradeComm, 2)}</td>
         <td class="n ${Math.abs(d.commDiff) > tol(d) ? 'neg' : ''}">${fmt(d.commDiff, 2)}</td></tr>`).join('') || '<tr><td colspan="10">нет дней с комиссией</td></tr>'}
@@ -877,7 +968,7 @@ V.instr = (el, sel) => {
     </div>
     <h2>Все инструменты</h2>
     <div class="tbl"><table id="tInstr"><thead><tr>${cols.map(c => `<th data-k="${c[0]}" class="${c[0] === 'k' ? '' : 'n'}">${c[1]}${sk[0] === c[0] ? (sk[1] > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>
-      ${list.map(a => `<tr>${cols.map(c => c[0] === 'k' ? `<td>${a.k}</td>` : `<td class="n ${['vm', 'vmPrice', 'funding', 'net'].includes(c[0]) ? sign(a[c[0]]) : ''}">${fmt(a[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>`).join('')}
+      ${list.map(a => `<tr>${cols.map(c => c[0] === 'k' ? `<td>${esc(a.k)}</td>` : `<td class="n ${['vm', 'vmPrice', 'funding', 'net'].includes(c[0]) ? sign(a[c[0]]) : ''}">${fmt(a[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>`).join('')}
       <tr class="tot">${cols.map(c => c[0] === 'k' ? '<td>Итого</td>' : `<td class="n">${fmt(T[c[0]], c[2])}${c[0].endsWith('Pct') || c[0] === 'costShare' ? '%' : ''}</td>`).join('')}</tr>
     </tbody></table></div>`;
   el.querySelectorAll('#instrMode button').forEach(b => b.onclick = () => { state.instrBase = b.dataset.b === '1'; render(); });
@@ -946,6 +1037,10 @@ V.stock = (el, sel) => {
 };
 
 V.margin = (el, sel) => {
+  // ГО, деньги и остаток на Т+1 есть только в однодневных справках
+  const hadPartial = sel.some(s => s.days.some(d => d.partial));
+  sel = sel.map(s => ({ ...s, days: s.days.filter(d => !d.partial) }));
+  if (!sel.some(s => s.days.length)) { el.innerHTML = `<div class="empty">ГО, деньги, обеспечение и РЕПО по дням есть только в однодневных справках. Для выбранного периода загружены только справки за период.</div>`; return; }
   const dates = [...new Set(sel.flatMap(s => s.days.map(d => d.date)))].sort();
   const sumBy = f => dates.map(dt => sel.reduce((t, s) => { const d = s.days.find(x => x.date === dt); return t + (d ? f(d) : 0); }, 0));
   const go = sumBy(d => d.go), eq = sumBy(d => d.equity), cash = sumBy(d => d.r.money.out || 0);
@@ -966,6 +1061,7 @@ V.margin = (el, sel) => {
       ${kpi('Дней с платой за нехватку ГО', String(shortDays.length), 'из ' + dates.length, shortDays.length ? 'bad' : '')}
       ${kpi('Плата за нехватку ГО', fmt(fees.reduce((a, b) => a + b, 0)) + ' ₽', 'за выбранный период', shortDays.length ? 'bad' : '')}
     </div>
+    ${hadPartial ? '<p class="note warn">Дни, покрытые справкой за период, здесь не показаны: ГО, деньги и остаток на Т+1 по дням есть только в однодневных справках.</p>' : ''}
     <p class="note">ГО — «Оценка позиции по ПФИ» на конец дня. Деньги — исходящий рублёвый остаток. «Долг, покрытый бумагами» — часть ГО сверх денег, которую брокер покрывает ценными бумагами («Задолженность прочая»). Брокер берёт плату за нехватку ГО в дни, когда ГО больше обеспечения по его собственным дисконтам — их справка не показывает, поэтому здесь видны только фактические списания.</p>
     <h2>Что покрывает ГО</h2>
     <p class="note">Брокер сравнивает ГО не со стоимостью счёта, а с обеспечением: деньги — полностью, облигации и акции — с дисконтом, фонды ФИНАМ — никак. Столбцы — состав счёта на конец дня, линия — ГО. Красные точки — обеспечение, каким его посчитал брокер в дни платы за нехватку: ГО − плата / дневная ставка${rates.any ? ` (ставка выведена из пеней ближайшего по времени дня: ${rates.range.map(v => fmt(v * 100, 4) + '%').join(' – ')} в день)` : ' (ставка не определена: в справках нет пеней)'}. Чем ниже точка под линией ГО, тем больше нехватка.</p>
@@ -1007,17 +1103,25 @@ V.data = (el) => {
   for (const r of state.reports) (byAcc[r.account] || (byAcc[r.account] = [])).push(r);
   const info = Object.entries(byAcc).map(([a, rs]) => {
     rs.sort((x, y) => x.date.localeCompare(y.date));
-    const gaps = []; for (let i = 1; i < rs.length; i++) { const exp = addDays(rs[i - 1].date, 1); if (rs[i].date !== exp) gaps.push(`${exp} … ${addDays(rs[i].date, -1)}`); }
+    // покрытые дни: однодневные справки и все дни справок за период; пропуск — любой непокрытый день, выходные тоже
+    const covered = new Set(); for (const r of rs) for (let d = r.date; d <= (r.dateTo || r.date); d = addDays(d, 1)) covered.add(d);
+    const cd = [...covered].sort(), gaps = [];
+    for (let i = 1; i < cd.length; i++) {
+      const exp = addDays(cd[i - 1], 1); if (cd[i] === exp) continue;
+      const end = addDays(cd[i], -1); gaps.push(exp === end ? ddmm(exp) : `${ddmm(exp)}…${ddmm(end)}`);
+    }
+    const periods = rs.filter(r => r.dateTo && r.dateTo !== r.date).map(r => `${ddmm(r.date)}–${ddmm(r.dateTo)}`);
     const brief = rs.filter(r => !r.hasTrades && r.nontrade.some(n => n.cls === 'brokerUnknown')).map(r => r.date);
-    return { a, rs, gaps, brief };
+    return { a, rs, gaps, brief, periods, cd };
   });
   el.innerHTML = `
     <div class="drop" id="drop">
-      <div class="req">Нужна <u>полная</u> «Справка о состоянии обязательств» ФИНАМ <u>за один день</u></div>
-      <div class="path">Личный кабинет → Счёт → Справка → <b>Полная</b> → дата (один день) → <b>Excel</b></div>
+      <div class="req">Нужна <u>полная</u> «Справка о состоянии обязательств» ФИНАМ</div>
+      <div class="path">Личный кабинет → Счёт → Справка → <b>Полная</b> → дата (один день или период) → <b>Excel</b></div>
       <ul class="reqlist">
         <li>в личном кабинете выберите <b>полную</b> справку, не краткую: в краткой нет сделок и расшифровки списаний;</li>
-        <li>период — <b>один день</b>; за каждый нужный день — своя справка (файл «… (01.10.2026 по 01.10.2026).xls»);</li>
+        <li>лучше всего — <b>за каждый день</b> своя справка (файл «… (01.10.2026 по 01.10.2026).xls»): тогда видны стоимость счёта, ГО и прибыль по дням;</li>
+        <li>можно и <b>за период</b>: будут затраты, ставки, сделки, фандинг и прибыль за период, но без стоимости счёта и ГО по дням. Добавьте однодневную справку за последний торговый день перед началом периода — тогда маржа за период будет точной;</li>
         <li>загружайте файл <b>как есть</b>: не открывайте и не пересохраняйте его в Excel.</li>
       </ul>
       <b>Перетащите справки сюда</b> или <a href="#" id="pick">выберите файлы</a> — можно сразу за много дней и по нескольким счетам. Неподходящие файлы страница не примет и объяснит почему.
@@ -1025,17 +1129,18 @@ V.data = (el) => {
     <p class="note" style="margin-top:12px">Файлы разбираются прямо в браузере и никуда не отправляются. Разобранные дни сохраняются в этом браузере, так что в следующий раз достаточно добавить только новые справки. Справка за тот же день и счёт заменяет старую.</p>
     <p class="note"><b>Не удаляйте скачанные справки — храните их в одной папке.</b> В браузере лежат только результаты разбора, а не сами файлы. Новая версия страницы, которая достаёт из справки больше данных, попросит загрузить их заново: аналитика пересобирается из исходных файлов. Хранилище браузера к тому же может очиститься само — при очистке истории, в режиме инкогнито, в другом браузере.</p>
     ${info.map(x => `<h2>Счёт ${esc(x.a)}</h2>
-      <div class="chips"><span class="chip">${x.rs.length} дн.</span><span class="chip ${x.rs.some(r => r.v !== PARSER_VERSION) ? 'warn' : ''}">разобрано версией ${[...new Set(x.rs.map(r => r.v || 1))].join(', ')}${x.rs.some(r => r.v !== PARSER_VERSION) ? ` — нужна ${PARSER_VERSION}` : ' (текущая)'}</span><span class="chip">${x.rs[0].date} … ${x.rs.at(-1).date}</span>
+      <div class="chips"><span class="chip">${x.rs.length} справок</span>${x.periods.length ? `<span class="chip warn">за период: ${x.periods.join(', ')} — без стоимости счёта и ГО по дням</span>` : ''}<span class="chip ${x.rs.some(r => r.v !== PARSER_VERSION) ? 'warn' : ''}">разобрано версией ${[...new Set(x.rs.map(r => r.v || 1))].join(', ')}${x.rs.some(r => r.v !== PARSER_VERSION) ? ` — нужна ${PARSER_VERSION}` : ' (текущая)'}</span><span class="chip">${ddmm(x.cd[0])} … ${ddmm(x.cd.at(-1))}</span>
         ${x.gaps.length ? `<span class="chip warn">пропуски: ${x.gaps.join(', ')}</span>` : '<span class="chip">без пропусков</span>'}
         ${x.brief.length ? `<span class="chip warn">краткий формат (нет сделок и расшифровки списаний): ${x.brief.join(', ')}</span>` : ''}
-        <button data-del="${x.a}">удалить счёт</button></div>`).join('') || '<p class="note">Пока ничего не загружено.</p>'}
+        <button data-del="${esc(x.a)}">удалить счёт</button></div>`).join('') || '<p class="note">Пока ничего не загружено.</p>'}
+    ${(state.periodWarn || []).length ? `<div class="rejected"><h2>Не используются</h2><ul>${state.periodWarn.map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
     ${state.lastLoad ? `<p class="note">Последняя загрузка: принято ${state.lastLoad.ok} из ${state.lastLoad.total}${state.lastLoad.replaced ? `, из них ${state.lastLoad.replaced} заменили уже загруженные дни` : ''}.</p>` : ''}
-    ${state.errors?.length ? `<div class="rejected"><h2>Не приняты: ${state.errors.length}</h2><div class="tbl"><table><thead><tr><th>Файл</th><th>Причина</th></tr></thead><tbody>${state.errors.map(e => `<tr><td>${esc(e.name)}</td><td class="neg" style="white-space:normal">${e.error}</td></tr>`).join('')}</tbody></table></div></div>` : ''}`;
+    ${state.errors?.length ? `<div class="rejected"><h2>Не приняты: ${state.errors.length}</h2><div class="tbl"><table><thead><tr><th>Файл</th><th>Причина</th></tr></thead><tbody>${state.errors.map(e => `<tr><td>${esc(e.name)}</td><td class="neg" style="white-space:normal">${esc(e.error)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}`;
   bindDrop(el.querySelector('#drop'));
   el.querySelector('#pick').onclick = e => { e.preventDefault(); document.getElementById('fileInput').click(); };
   el.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!confirm(`Удалить из браузера все справки счёта ${b.dataset.del}?`)) return;
-    for (const r of state.reports.filter(r => r.account === b.dataset.del)) await DB.del(r.account + '|' + r.date);
+    for (const r of state.reports.filter(r => r.account === b.dataset.del)) await DB.del(DB.key(r));
     await reload();
   });
 };
@@ -1045,7 +1150,14 @@ let worker = null;
 const WORKER_BOOT = `
 self.onmessage = async (e) => {
   const { id, file } = e.data;
-  try { self.postMessage({ id, ok: true, report: parseReport(await file.text()) }); }
+  try {
+    const buf = await file.arrayBuffer();
+    let text = new TextDecoder('utf-8').decode(buf);
+    if (/windows-1251|cp1251/i.test(text.slice(0, 1000)) || !text.includes('Справка')) {
+      try { text = new TextDecoder('windows-1251').decode(buf); } catch (err) {}
+    }
+    self.postMessage({ id, ok: true, report: parseReport(text) });
+  }
   catch (err) { self.postMessage({ id, ok: false, code: err.code || 'ERROR', extra: err.extra || '', error: String(err.message || err) }); }
 };`;
 function getWorker() {
@@ -1053,9 +1165,18 @@ function getWorker() {
   return worker;
 }
 let inlineParse = null;
-function parseInline(file) {
+async function parseInline(file) {
   if (!inlineParse) inlineParse = new Function(document.getElementById('parserSrc').textContent + '; return parseReport;')();
-  return file.text().then(t => ({ ok: true, report: inlineParse(t) })).catch(e => ({ ok: false, code: e.code || 'ERROR', extra: e.extra || '', error: String(e.message || e) }));
+  try {
+    const buf = await file.arrayBuffer();
+    let text = new TextDecoder('utf-8').decode(buf);
+    if (/windows-1251|cp1251/i.test(text.slice(0, 1000)) || !text.includes('Справка')) {
+      try { text = new TextDecoder('windows-1251').decode(buf); } catch (err) {}
+    }
+    return { ok: true, report: inlineParse(text) };
+  } catch (e) {
+    return { ok: false, code: e.code || 'ERROR', extra: e.extra || '', error: String(e.message || e) };
+  }
 }
 function parseFile(file) {
   let w; try { w = getWorker(); } catch (e) { return parseInline(file); }
@@ -1085,7 +1206,7 @@ async function loadFiles(files) {
     if (prog) { prog.classList.remove('hide'); txt.textContent = `Разбираю ${i + 1} из ${files.length}: ${files[i].name}`; bar.style.width = `${i / files.length * 100}%`; }
     const res = files[i].size > 200e6 ? { ok: false, code: 'TOO_BIG' } : await parseFile(files[i]);
     if (!res.ok) { state.errors.push({ name: files[i].name, code: res.code, error: (REJECT_TEXT[res.code] || REJECT_TEXT.ERROR)(res.extra, res.error) }); continue; }
-    if (state.reports.some(r => r.account === res.report.account && r.date === res.report.date)) state.replaced = (state.replaced || 0) + 1;
+    if (state.reports.some(r => DB.key(r) === DB.key(res.report))) state.replaced = (state.replaced || 0) + 1;
     await DB.put(res.report); ok++;
   }
   await reload();
@@ -1111,7 +1232,7 @@ async function reload() {
   state.stale = state.reports.filter(r => r.v !== PARSER_VERSION);
   M = model();
   const sel = document.getElementById('fAcc'), cur = state.acc;
-  sel.innerHTML = (M.accs.length > 1 ? '<option value="__all">все вместе</option>' : '') + M.accs.map(a => `<option>${a}</option>`).join('');
+  sel.innerHTML = (M.accs.length > 1 ? '<option value="__all">все вместе</option>' : '') + M.accs.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
   state.acc = [...sel.options].some(o => o.value === cur) ? cur : sel.options[0]?.value || '__all';
   sel.value = state.acc;
   const all = state.reports.map(r => r.date).sort();
@@ -1128,18 +1249,34 @@ function gapsBanner(sel) {
   for (const s of sel) {
     const ds = s.days.map(d => d.date); if (ds.length < 2) continue;
     const have = new Set(ds), miss = [];
-    for (let d = addDays(ds[0], 1); d < ds.at(-1); d = addDays(d, 1)) if (!have.has(d)) miss.push(d);
+    for (let d = addDays(ds[0], 1); d < ds.at(-1); d = addDays(d, 1)) {
+      if (weekday(d) % 6 !== 0 && !have.has(d)) miss.push(d);
+    }
     if (!miss.length) continue;
     const ranges = []; let a = miss[0], b = miss[0];
-    for (const d of miss.slice(1)) { if (d === addDays(b, 1)) b = d; else { ranges.push([a, b]); a = b = d; } }
+    for (const d of miss.slice(1)) {
+      const isNextWorkDay = d === addDays(b, 1) || (weekday(b) === 5 && d === addDays(b, 3));
+      if (isNextWorkDay) b = d;
+      else { ranges.push([a, b]); a = b = d; }
+    }
     ranges.push([a, b]);
-    out.push(`по счёту <b>${esc(s.acc)}</b> не хватает справок за ${miss.length} дн.: ${ranges.map(([x, y]) => x === y ? ddmm(x) : ddmm(x) + '–' + ddmm(y)).join(', ')}`);
+    out.push(`по счёту <b>${esc(s.acc)}</b> не хватает справок за ${miss.length} торг. дн.: ${ranges.map(([x, y]) => x === y ? ddmm(x) : ddmm(x) + '–' + ddmm(y)).join(', ')}`);
   }
-  return out.length ? `<div class="rejected gaps"><h2>Не хватает справок — цифры за период неполные</h2><ul>${out.map(x => `<li>${x}</li>`).join('')}</ul>
-    <p class="note" style="margin:6px 0 0">За пропущенные дни не учтены изменение стоимости счёта, маржа, списания и сделки. Загрузите полные справки за эти даты на вкладке «Данные».</p></div>` : '';
+  return out.length ? `<div class="rejected gaps"><h2>Не хватает справок за торговые дни — цифры за период неполные</h2><ul>${out.map(x => `<li>${x}</li>`).join('')}</ul>
+    <p class="note" style="margin:6px 0 0">За пропущенные торговые дни не учтены изменение стоимости счёта, маржа, списания и сделки. Загрузите полные справки за эти даты на вкладке «Данные».</p></div>` : '';
 }
-// ключ подтверждения: вкладка + счёт + период — при любом переключении окно появляется снова
-const gapKey = () => [state.tab, state.acc, state.from, state.to, state.group].join('|');
+// ключ подтверждения: счёт + период — окно не блокирует при переключении вкладок
+function periodBanner(sel) {
+  const items = [];
+  for (const s of sel) {
+    const lasts = s.days.filter(d => d.partial && d.r.period.last);
+    for (const d of lasts) items.push(`по счёту <b>${esc(s.acc)}</b> ${ddmm(d.r.period.from)}–${ddmm(d.r.period.to)} — справка за период` +
+      (d.vmApprox ? `; <span class="neg">маржа дня перед периодом неизвестна — загрузите однодневную справку за последний торговый день перед ним, ${ddmm(lastClearingBefore(d.r.period.from))}, иначе срочный и фондовый рынок разделены приблизительно (общая прибыль точная)</span>` : ''));
+  }
+  return items.length ? `<div class="rejected" style="border-color:var(--warn);margin:0 0 16px"><h2 style="color:var(--warn)">Есть справки за период</h2><ul style="margin:4px 0 0 18px">${items.map(x => `<li>${x}</li>`).join('')}</ul>
+    <p class="note" style="margin:6px 0 0">По ним известны затраты, ставки брокера, сделки, фандинг, РЕПО и купоны по дням, а стоимость счёта, деньги и ГО — только на начало и конец. Поэтому прибыль за такой период стоит на графиках последним днём периода, а вкладка «ГО и обязательства» показывает только дни с однодневными справками.</p></div>` : '';
+}
+const gapKey = () => [state.acc, state.from, state.to].join('|');
 function render() {
   credits();
   document.getElementById('view').classList.remove('blocked');
@@ -1149,7 +1286,8 @@ function render() {
   const el = document.getElementById('view');
   if (state.tab === 'data' || !M || !M.accs.length) { if (state.tab !== 'data' && (!M || !M.accs.length)) state.tab = 'data'; V.data(el); }
   else {
-    const sel = selected(); V[state.tab](el, sel); const g = gapsBanner(sel);
+    const sel = selected(); V[state.tab](el, sel); const g = gapsBanner(sel); const pb = periodBanner(sel);
+    if (pb) el.insertAdjacentHTML('afterbegin', pb);
     if (g) {
       el.insertAdjacentHTML('afterbegin', g);
       if (state.gapAck !== gapKey()) {
