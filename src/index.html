@@ -91,6 +91,8 @@ tr.tot td { font-weight: 600; background: var(--surface2); }
 .empty { padding: 50px 20px; text-align: center; color: var(--dim); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--border); }
+.chip button.x { border: 0; background: none; color: inherit; cursor: pointer; padding: 0 0 0 4px; font-size: 13px; line-height: 1; }
+.rejected li button { margin: 4px 6px 0 0; font-size: 12px; }
 .hide { display: none !important; }
 .posgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; margin-bottom: 8px; }
 .poscell { display: flex; justify-content: space-between; gap: 8px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface2); font-size: 13px; }
@@ -709,9 +711,12 @@ function model() {
     const daily = byAcc[a].filter(r => r.date === r.dateTo), dset = new Set(daily.map(r => r.date)), used = [];
     for (const r of byAcc[a].filter(r => r.date !== r.dateTo).sort((x, y) => x.date.localeCompare(y.date))) {
       let clash = '';
-      for (let d = r.date; d <= r.dateTo; d = addDays(d, 1)) if (dset.has(d)) { clash = 'пересекается с однодневной справкой за ' + ddmm(d); break; }
+      const inside = daily.filter(x => x.date >= r.date && x.date <= r.dateTo);
+      if (inside.length) clash = inside.length === 1 ? 'пересекается с однодневной справкой за ' + ddmm(inside[0].date)
+        : `пересекается с однодневными справками (${inside.length} шт., ${ddmm(inside[0].date)}…${ddmm(inside.at(-1).date)})`;
       if (!clash) for (const u of used) if (!(r.dateTo < u.date || r.date > u.dateTo)) clash = `пересекается со справкой за ${ddmm(u.date)}–${ddmm(u.dateTo)}`;
-      if (clash) { state.periodWarn.push(`Справка за ${ddmm(r.date)}–${ddmm(r.dateTo)} по счёту ${a} не используется: ${clash}. Удалите лишнее на вкладке «Данные».`); continue; }
+      if (clash) { state.periodWarn.push({ text: `Справка за ${ddmm(r.date)}–${ddmm(r.dateTo)} по счёту ${a} не используется: ${clash}.`,
+        key: DB.key(r), dailyKeys: inside.map(DB.key) }); continue; }
       used.push(r);
     }
     const days = buildAccount([...daily, ...used.flatMap(expandPeriod)]); const rates = deriveRates(days); applyRates(days, rates);
@@ -1110,7 +1115,7 @@ V.data = (el) => {
       const exp = addDays(cd[i - 1], 1); if (cd[i] === exp) continue;
       const end = addDays(cd[i], -1); gaps.push(exp === end ? ddmm(exp) : `${ddmm(exp)}…${ddmm(end)}`);
     }
-    const periods = rs.filter(r => r.dateTo && r.dateTo !== r.date).map(r => `${ddmm(r.date)}–${ddmm(r.dateTo)}`);
+    const periods = rs.filter(r => r.dateTo && r.dateTo !== r.date);
     const brief = rs.filter(r => !r.hasTrades && r.nontrade.some(n => n.cls === 'brokerUnknown')).map(r => r.date);
     return { a, rs, gaps, brief, periods, cd };
   });
@@ -1129,11 +1134,12 @@ V.data = (el) => {
     <p class="note" style="margin-top:12px">Файлы разбираются прямо в браузере и никуда не отправляются. Разобранные дни сохраняются в этом браузере, так что в следующий раз достаточно добавить только новые справки. Справка за тот же день и счёт заменяет старую.</p>
     <p class="note"><b>Не удаляйте скачанные справки — храните их в одной папке.</b> В браузере лежат только результаты разбора, а не сами файлы. Новая версия страницы, которая достаёт из справки больше данных, попросит загрузить их заново: аналитика пересобирается из исходных файлов. Хранилище браузера к тому же может очиститься само — при очистке истории, в режиме инкогнито, в другом браузере.</p>
     ${info.map(x => `<h2>Счёт ${esc(x.a)}</h2>
-      <div class="chips"><span class="chip">${x.rs.length} справок</span>${x.periods.length ? `<span class="chip warn">за период: ${x.periods.join(', ')} — без стоимости счёта и ГО по дням</span>` : ''}<span class="chip ${x.rs.some(r => r.v !== PARSER_VERSION) ? 'warn' : ''}">разобрано версией ${[...new Set(x.rs.map(r => r.v || 1))].join(', ')}${x.rs.some(r => r.v !== PARSER_VERSION) ? ` — нужна ${PARSER_VERSION}` : ' (текущая)'}</span><span class="chip">${ddmm(x.cd[0])} … ${ddmm(x.cd.at(-1))}</span>
+      <div class="chips"><span class="chip">${x.rs.length} справок</span>${x.periods.map(r => `<span class="chip warn">за период ${ddmm(r.date)}–${ddmm(r.dateTo)} <button class="x" title="удалить эту справку" data-delone="${esc(DB.key(r))}">×</button></span>`).join('')}<span class="chip ${x.rs.some(r => r.v !== PARSER_VERSION) ? 'warn' : ''}">разобрано версией ${[...new Set(x.rs.map(r => r.v || 1))].join(', ')}${x.rs.some(r => r.v !== PARSER_VERSION) ? ` — нужна ${PARSER_VERSION}` : ' (текущая)'}</span><span class="chip">${ddmm(x.cd[0])} … ${ddmm(x.cd.at(-1))}</span>
         ${x.gaps.length ? `<span class="chip warn">пропуски: ${x.gaps.join(', ')}</span>` : '<span class="chip">без пропусков</span>'}
         ${x.brief.length ? `<span class="chip warn">краткий формат (нет сделок и расшифровки списаний): ${x.brief.join(', ')}</span>` : ''}
         <button data-del="${esc(x.a)}">удалить счёт</button></div>`).join('') || '<p class="note">Пока ничего не загружено.</p>'}
-    ${(state.periodWarn || []).length ? `<div class="rejected"><h2>Не используются</h2><ul>${state.periodWarn.map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    ${(state.periodWarn || []).length ? `<div class="rejected"><h2>Не используются</h2><ul>${state.periodWarn.map((w, i) => `<li>${esc(w.text)}
+      <button data-delkey="${i}|p">удалить эту справку за период</button>${w.dailyKeys.length ? ` <button data-delkey="${i}|d">удалить однодневные за эти даты (${w.dailyKeys.length})</button>` : ''}</li>`).join('')}</ul></div>` : ''}
     ${state.lastLoad ? `<p class="note">Последняя загрузка: принято ${state.lastLoad.ok} из ${state.lastLoad.total}${state.lastLoad.replaced ? `, из них ${state.lastLoad.replaced} заменили уже загруженные дни` : ''}.</p>` : ''}
     ${state.errors?.length ? `<div class="rejected"><h2>Не приняты: ${state.errors.length}</h2><div class="tbl"><table><thead><tr><th>Файл</th><th>Причина</th></tr></thead><tbody>${state.errors.map(e => `<tr><td>${esc(e.name)}</td><td class="neg" style="white-space:normal">${esc(e.error)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}`;
   bindDrop(el.querySelector('#drop'));
@@ -1141,6 +1147,16 @@ V.data = (el) => {
   el.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!confirm(`Удалить из браузера все справки счёта ${b.dataset.del}?`)) return;
     for (const r of state.reports.filter(r => r.account === b.dataset.del)) await DB.del(DB.key(r));
+    await reload();
+  });
+  el.querySelectorAll('[data-delone]').forEach(b => b.onclick = async () => {
+    if (!confirm('Удалить из браузера эту справку за период?')) return;
+    await DB.del(b.dataset.delone); await reload();
+  });
+  el.querySelectorAll('[data-delkey]').forEach(b => b.onclick = async () => {
+    const [i, what] = b.dataset.delkey.split('|'), w = state.periodWarn[+i], keys = what === 'p' ? [w.key] : w.dailyKeys;
+    if (!confirm(what === 'p' ? 'Удалить из браузера эту справку за период?' : `Удалить из браузера ${keys.length} однодневных справок за эти даты? Справка за период займёт их место.`)) return;
+    for (const k of keys) await DB.del(k);
     await reload();
   });
 };
