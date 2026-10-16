@@ -1054,8 +1054,8 @@ V.margin = (el, sel) => {
   const parts = dates.map(dt => sel.reduce((t, s) => { const d = s.days.find(x => x.date === dt); if (d) { const p = coverParts(d); for (const k in p) t[k] = (t[k] || 0) + p[k]; } return t; }, {}));
   el.innerHTML = `
     <div class="grid kpis">
-      ${kpi('ГО на ' + (lastDay || '—'), fmt(go.at(-1)) + ' ₽', `${fmt(eq.at(-1) ? go.at(-1) / eq.at(-1) * 100 : NaN, 1)}% от стоимости счёта`)}
-      ${kpi('Максимум ГО', fmt(Math.max(0, ...go)) + ' ₽', dates[go.indexOf(Math.max(...go))] || '')}
+      ${kpi('ГО на ' + (dates.length ? ddmm(dates.at(-1)) : '—'), fmt(go.at(-1)) + ' ₽', `${fmt(eq.at(-1) ? go.at(-1) / eq.at(-1) * 100 : NaN, 1)}% от стоимости счёта`)}
+      ${kpi('Максимум ГО', fmt(Math.max(0, ...go)) + ' ₽', dates.length ? ddmm(dates[go.indexOf(Math.max(...go))]) : '')}
       ${kpi('Деньги на конец дня', fmt(cash.at(-1)) + ' ₽', 'остаток на Т+1, после расчётов: ' + fmt(t1.at(-1)) + ' ₽')}
       ${kpi('Перенесено через РЕПО', fmt(repoVol.reduce((a, b) => a + b, 0)) + ' ₽', `${repoVol.filter(v => v).length} дн. · цена переноса ${fmt(repoCost.reduce((a, b) => a + b, 0))} ₽`, repoVol.some(v => v) ? 'bad' : '')}
       ${kpi('Дней с платой за нехватку ГО', String(shortDays.length), 'из ' + dates.length, shortDays.length ? 'bad' : '')}
