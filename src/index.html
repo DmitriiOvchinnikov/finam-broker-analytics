@@ -898,11 +898,16 @@ V.summary = (el, sel) => {
   const gcost = k => Object.values(G.P[k].costs).reduce((a, b) => a + b, 0);
   // затраты в другом масштабе — линией по правой оси
   const op = baseOpts(false);
-  op.scales.y2 = { position: 'right', beginAtZero: true, max: 0, grid: { display: false }, title: { display: true, text: 'затраты, ₽', color: css('--dim') }, ticks: { color: css('--c4'), callback: v => fmtAxis(v) } };
+  op.scales.y2 = { position: 'right', beginAtZero: true, max: 0, grid: { display: false }, title: { display: true, text: 'затраты, ₽', color: css('--c4') }, ticks: { color: css('--c4'), callback: v => fmtAxis(v) } };
   op.plugins.tooltip.callbacks.label = c => c.dataset.yAxisID === 'y2' ? `Затраты: ${fmt(c.parsed.y)} ₽` : `Прибыль: ${fmt(c.parsed.y)} ₽`;
+  // прибыль — левая ось, первая в легенде и зелёная (у столбцов цвет по знаку, легенда иначе взяла бы цвет первого столбца)
+  op.scales.y.ticks.color = css('--gain');
+  op.scales.y.title = { display: true, text: 'прибыль, ₽', color: css('--gain') };
+  op.plugins.legend.labels.generateLabels = ch => Chart.defaults.plugins.legend.labels.generateLabels(ch)
+    .map(l => l.datasetIndex === 0 ? { ...l, fillStyle: css('--gain'), strokeStyle: css('--gain') } : l);
   chart(document.getElementById('cPnl'), { type: 'bar', options: op, data: { labels: G.keys.map(k => periodLabel(k, state.group)), datasets: [
-    { type: 'line', label: 'Затраты (правая ось)', data: G.keys.map(k => -gcost(k)), yAxisID: 'y2', borderColor: css('--c4'), backgroundColor: css('--c4'), borderWidth: 2, pointRadius: 2, order: 0 },
-    { label: 'Прибыль', data: G.keys.map(k => G.P[k].pnl), backgroundColor: G.keys.map(k => G.P[k].pnl >= 0 ? css('--gain') : css('--loss')), order: 1 } ] } });
+    { label: 'Прибыль (левая ось)', data: G.keys.map(k => G.P[k].pnl), backgroundColor: G.keys.map(k => G.P[k].pnl >= 0 ? css('--gain') : css('--loss')), order: 1 },
+    { type: 'line', label: 'Затраты (правая ось)', data: G.keys.map(k => -gcost(k)), yAxisID: 'y2', borderColor: css('--c4'), backgroundColor: css('--c4'), borderWidth: 2, pointRadius: 2, order: 0 } ] } });
   // стоимость счёта на конец периода и накопленная прибыль — в той же группировке, что и остальные графики
   let cum = 0; const cumS = G.keys.map(k => (cum += G.P[k].pnl));
   const eqS = G.keys.map(k => Object.values(G.P[k].eq).reduce((a, b) => a + b, 0));
