@@ -92,7 +92,10 @@ tr.tot td { font-weight: 600; background: var(--surface2); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--border); }
 .chip button.x { border: 0; background: none; color: inherit; cursor: pointer; padding: 0 0 0 4px; font-size: 13px; line-height: 1; }
-.rejected li button { margin: 4px 6px 0 0; font-size: 12px; }
+.rejected li button, .infobox li button { margin: 4px 6px 0 0; font-size: 12px; }
+.infobox { margin-top: 16px; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.infobox h2 { margin-top: 0; }
+.infobox ul { margin: 4px 0 0 18px; }
 .hide { display: none !important; }
 .posgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; margin-bottom: 8px; }
 .poscell { display: flex; justify-content: space-between; gap: 8px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface2); font-size: 13px; }
@@ -125,6 +128,7 @@ footer a { color: var(--dim); }
   <span class="seg" id="fGroup">
     <button data-g="day" class="on">день</button><button data-g="week">неделя</button><button data-g="month">месяц</button>
   </span>
+  <button id="btnFolder" class="primary hide" title="Загрузить новые и изменённые справки из подключённой папки">Обновить из папки</button>
   <button id="btnLoad" class="primary">Загрузить справки</button>
   <input type="file" id="fileInput" multiple class="hide">
 </header>
@@ -362,20 +366,24 @@ const APP = { name: 'Брокерская аналитика ФИНАМ', versio
 const DB = {
   open() {
     return this.p || (this.p = new Promise((res, rej) => {
-      const q = indexedDB.open('finam-broker-analytics', 1);
-      q.onupgradeneeded = () => q.result.createObjectStore('reports');
+      const q = indexedDB.open('finam-broker-analytics', 2);
+      // reports — разобранные справки; meta — подключённая папка и список уже просмотренных в ней файлов
+      q.onupgradeneeded = () => { for (const n of ['reports', 'meta']) if (!q.result.objectStoreNames.contains(n)) q.result.createObjectStore(n); };
       q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
     }));
   },
-  async tx(mode, fn) {
+  async tx(mode, fn, store = 'reports') {
     const db = await this.open();
     return new Promise((res, rej) => {
-      const t = db.transaction('reports', mode), st = t.objectStore('reports'); const out = fn(st);
+      const t = db.transaction(store, mode), st = t.objectStore(store); const out = fn(st);
       t.oncomplete = () => res(out && out.result !== undefined ? out.result : undefined); t.onerror = () => rej(t.error);
     });
   },
   key: r => r.account + '|' + r.date + (r.dateTo && r.dateTo !== r.date ? '..' + r.dateTo : ''),
-  put(r) { return this.tx('readwrite', st => st.put(r, this.key(r))); },
+  put(r) { r.loadedAt = Date.now(); return this.tx('readwrite', st => st.put(r, this.key(r))); },
+  getMeta(k) { return this.tx('readonly', st => st.get(k), 'meta'); },
+  setMeta(k, v) { return this.tx('readwrite', st => st.put(v, k), 'meta'); },
+  delMeta(k) { return this.tx('readwrite', st => st.delete(k), 'meta'); },
   all() { return this.tx('readonly', st => st.getAll()); },
   del(key) { return this.tx('readwrite', st => st.delete(key)); },
   clear() { return this.tx('readwrite', st => st.clear()); },
@@ -760,15 +768,22 @@ function model() {
   const res = {};
   state.periodWarn = [];
   for (const a of accs) {
-    const daily = byAcc[a].filter(r => r.date === r.dateTo), dset = new Set(daily.map(r => r.date)), used = [];
-    for (const r of byAcc[a].filter(r => r.date !== r.dateTo).sort((x, y) => x.date.localeCompare(y.date))) {
-      let clash = '';
+    // Правило без участия пользователя: данные не теряем и пропусков не создаём.
+    // Справки за период — от длинной к короткой (при равной длине — загруженная позже); пересекающаяся с уже выбранной
+    // не используется. Если однодневные покрывают все дни периода — период не нужен; если не все — берём период,
+    // а однодневные внутри него откладываем (иначе непокрытые дни стали бы пропуском).
+    let daily = byAcc[a].filter(r => r.date === r.dateTo);
+    const span = r => Math.round((Date.parse(r.dateTo) - Date.parse(r.date)) / 864e5) + 1, used = [];
+    const periods = byAcc[a].filter(r => r.date !== r.dateTo).sort((x, y) => span(y) - span(x) || (y.loadedAt || 0) - (x.loadedAt || 0));
+    for (const r of periods) {
+      const P = `${ddmm(r.date)}–${ddmm(r.dateTo)}`, u = used.find(u => !(r.dateTo < u.date || r.date > u.dateTo));
+      if (u) { state.periodWarn.push({ text: `Справка за ${P} по счёту ${a} не используется: пересекается со справкой за ${ddmm(u.date)}–${ddmm(u.dateTo)}, которая покрывает больше дней.`, key: DB.key(r), dailyKeys: [] }); continue; }
       const inside = daily.filter(x => x.date >= r.date && x.date <= r.dateTo);
-      if (inside.length) clash = inside.length === 1 ? 'пересекается с однодневной справкой за ' + ddmm(inside[0].date)
-        : `пересекается с однодневными справками (${inside.length} шт., ${ddmm(inside[0].date)}…${ddmm(inside.at(-1).date)})`;
-      if (!clash) for (const u of used) if (!(r.dateTo < u.date || r.date > u.dateTo)) clash = `пересекается со справкой за ${ddmm(u.date)}–${ddmm(u.dateTo)}`;
-      if (clash) { state.periodWarn.push({ text: `Справка за ${ddmm(r.date)}–${ddmm(r.dateTo)} по счёту ${a} не используется: ${clash}.`,
-        key: DB.key(r), dailyKeys: inside.map(DB.key) }); continue; }
+      if (inside.length === span(r)) { state.periodWarn.push({ text: `Справка за ${P} по счёту ${a} не нужна: все её дни есть в однодневных справках, по ним видно больше.`, key: DB.key(r), dailyKeys: [] }); continue; }
+      if (inside.length) {
+        state.periodWarn.push({ text: `Справка за ${P} по счёту ${a} используется вместо однодневных за ${inside.length === 1 ? ddmm(inside[0].date) : `${ddmm(inside[0].date)}…${ddmm(inside.at(-1).date)} (${inside.length} шт.)`}: однодневные покрывают период не полностью, а без справки за период остальные дни стали бы пропуском.`, key: DB.key(r), dailyKeys: inside.map(DB.key) });
+        daily = daily.filter(x => !inside.includes(x));
+      }
       used.push(r);
     }
     const days = buildAccount([...daily, ...used.flatMap(expandPeriod)]); const rates = deriveRates(days); applyRates(days, rates);
@@ -1202,6 +1217,14 @@ V.data = (el) => {
       </ul>
       <b>Перетащите справки сюда</b> или <a href="#" id="pick">выберите файлы</a> — можно сразу за много дней и по нескольким счетам. Неподходящие файлы страница не примет и объяснит почему.
       <div class="progress hide" id="prog"><span id="progText"></span><div class="bar"><i id="progBar"></i></div></div></div>
+    <div class="infobox"><h2>Папка со справками</h2>${!FOLDER.ok
+      ? '<p class="note" style="margin:0">Подключить папку можно в Chrome и Edge: страница сама находит в ней новые справки. В этом браузере перетаскивайте файлы.</p>'
+      : FOLDER.handle
+        ? `<p style="margin:0 0 6px">Подключена папка <b>${esc(FOLDER.handle.name)}</b> (с подпапками). ${FOLDER.perm === 'granted' ? '' : 'Браузер спросит разрешение на чтение — это его защита, один раз за сеанс.'}</p>
+           ${FOLDER.last ? `<p class="note" style="margin:0 0 6px">${FOLDER.last.error ? `<span class="neg">Не удалось просмотреть папку: ${esc(FOLDER.last.error)}</span>` : `Последний просмотр: файлов справок в папке ${FOLDER.last.total}, новых или изменённых ${FOLDER.last.fresh}.`}</p>` : ''}
+           <button id="fScan" class="primary">Обновить из папки</button> <button id="fPick">Выбрать другую папку</button> <button id="fForget">Отключить папку</button>`
+        : `<p class="note" style="margin:0 0 6px">Скачивайте справки из личного кабинета в одну папку и подключите её: при каждом открытии достаточно нажать «Обновить из папки» — страница загрузит только новые и изменённые справки, сама уберёт повторы и совместит справки за период с однодневными. Страница только читает папку. Подключайте папку только со своими справками: всё, что в ней лежит, попадёт в разбор.</p>
+           <button id="fPick" class="primary">Подключить папку</button>`}</div>
     <p class="note" style="margin-top:12px">Файлы разбираются прямо в браузере и никуда не отправляются. Разобранные дни сохраняются в этом браузере, так что в следующий раз достаточно добавить только новые справки. Справка за тот же день и счёт заменяет старую.</p>
     <p class="note"><b>Не удаляйте скачанные справки — храните их в одной папке.</b> В браузере лежат только результаты разбора, а не сами файлы. Новая версия страницы, которая достаёт из справки больше данных, попросит загрузить их заново: аналитика пересобирается из исходных файлов. Хранилище браузера к тому же может очиститься само — при очистке истории, в режиме инкогнито, в другом браузере.</p>
     ${info.map(x => `<h2>Счёт ${esc(x.a)}</h2>
@@ -1209,11 +1232,15 @@ V.data = (el) => {
         ${x.gaps.length ? `<span class="chip warn">пропуски: ${x.gaps.join(', ')}</span>` : '<span class="chip">без пропусков</span>'}
         ${x.brief.length ? `<span class="chip warn">краткий формат (нет сделок и расшифровки списаний): ${x.brief.join(', ')}</span>` : ''}
         <button data-del="${esc(x.a)}">удалить счёт</button></div>`).join('') || '<p class="note">Пока ничего не загружено.</p>'}
-    ${(state.periodWarn || []).length ? `<div class="rejected"><h2>Не используются</h2><ul>${state.periodWarn.map((w, i) => `<li>${esc(w.text)}
+    ${(state.periodWarn || []).length ? `<div class="infobox"><h2>Как совмещены справки за период и однодневные</h2><p class="note" style="margin:0 0 6px">Страница выбирает сама, удалять ничего не нужно. Кнопки — если хотите решить иначе.</p><ul>${state.periodWarn.map((w, i) => `<li>${esc(w.text)}
       <button data-delkey="${i}|p">удалить эту справку за период</button>${w.dailyKeys.length ? ` <button data-delkey="${i}|d">удалить однодневные за эти даты (${w.dailyKeys.length})</button>` : ''}</li>`).join('')}</ul></div>` : ''}
     ${state.lastLoad ? `<p class="note">Последняя загрузка: принято ${state.lastLoad.ok} из ${state.lastLoad.total}${state.lastLoad.replaced ? `, из них ${state.lastLoad.replaced} заменили уже загруженные дни` : ''}.</p>` : ''}
     ${state.errors?.length ? `<div class="rejected"><h2>Не приняты: ${state.errors.length}</h2><div class="tbl"><table><thead><tr><th>Файл</th><th>Причина</th></tr></thead><tbody>${state.errors.map(e => `<tr><td>${esc(e.name)}</td><td class="neg" style="white-space:normal">${esc(e.error)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}`;
   bindDrop(el.querySelector('#drop'));
+  const fb = id => el.querySelector(id);
+  if (fb('#fPick')) fb('#fPick').onclick = () => folderConnect();
+  if (fb('#fScan')) fb('#fScan').onclick = () => folderScan();
+  if (fb('#fForget')) fb('#fForget').onclick = () => { if (confirm('Отключить папку? Загруженные справки останутся в браузере.')) folderForget(); };
   el.querySelector('#pick').onclick = e => { e.preventDefault(); document.getElementById('fileInput').click(); };
   el.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!confirm(`Удалить из браузера все справки счёта ${b.dataset.del}?`)) return;
@@ -1282,6 +1309,59 @@ const REJECT_TEXT = {
   TOO_BIG: () => 'Файл больше 200 МБ — это не справка за один день.',
   ERROR: (x, e) => 'Не удалось разобрать: ' + e,
 };
+/* ---------- папка со справками (Chrome, Edge): страница только читает её ---------- */
+const FOLDER = { ok: typeof window !== 'undefined' && 'showDirectoryPicker' in window, handle: null, perm: '', last: null, busy: false };
+async function folderInit() {
+  if (!FOLDER.ok) return;
+  try { FOLDER.handle = (await DB.getMeta('dir')) || null; FOLDER.perm = FOLDER.handle ? await FOLDER.handle.queryPermission({ mode: 'read' }) : ''; }
+  catch (e) { FOLDER.handle = null; FOLDER.perm = ''; }
+  folderButton();
+}
+function folderButton() {
+  const b = document.getElementById('btnFolder'); if (!b) return;
+  b.classList.toggle('hide', !FOLDER.handle);
+  b.textContent = FOLDER.busy ? 'Просматриваю папку…' : 'Обновить из папки';
+}
+async function folderConnect() {
+  let h;
+  try { h = await window.showDirectoryPicker({ id: 'finam-reports', mode: 'read' }); } catch (e) { return; }   // отмена выбора
+  await DB.setMeta('dir', h); await DB.setMeta('dirIndex', {});
+  FOLDER.handle = h; FOLDER.perm = 'granted'; folderButton();
+  await folderScan();
+}
+async function folderForget() {
+  await DB.delMeta('dir'); await DB.delMeta('dirIndex');
+  FOLDER.handle = null; FOLDER.perm = ''; FOLDER.last = null; folderButton(); render();
+}
+// Новые и изменённые файлы (по размеру и времени изменения) — в обычную загрузку; при смене версии разборщика — все.
+// Просмотренные файлы запоминаются, в том числе отклонённые: их не разбираем повторно, пока файл не изменится.
+async function folderScan() {
+  const h = FOLDER.handle; if (!h || FOLDER.busy) return;
+  try {
+    if ((await h.queryPermission({ mode: 'read' })) !== 'granted' && (await h.requestPermission({ mode: 'read' })) !== 'granted') {
+      FOLDER.perm = 'denied'; render(); return;
+    }
+  } catch (e) { FOLDER.perm = 'denied'; render(); return; }
+  FOLDER.perm = 'granted'; FOLDER.busy = true; folderButton();
+  try {
+    const idx = (await DB.getMeta('dirIndex')) || {}, all = idx.__v !== PARSER_VERSION || state.stale?.length > 0;
+    const seen = { __v: PARSER_VERSION }, fresh = [];
+    const walk = async (dir, path) => {
+      for await (const [name, e] of dir.entries()) {
+        if (e.kind === 'directory') { await walk(e, path + name + '/'); continue; }
+        if (!/\.xls$/i.test(name)) continue;
+        const f = await e.getFile(), sig = f.size + '|' + f.lastModified;
+        seen[path + name] = sig; if (all || idx[path + name] !== sig) fresh.push(f);
+      }
+    };
+    await walk(h, '');
+    fresh.sort((x, y) => x.lastModified - y.lastModified);     // одна и та же справка скачана дважды — остаётся последняя
+    FOLDER.last = { at: new Date(), total: Object.keys(seen).length - 1, fresh: fresh.length };
+    if (fresh.length) await loadFiles(fresh); else render();
+    await DB.setMeta('dirIndex', seen);
+  } catch (e) { FOLDER.last = { at: new Date(), error: String(e.message || e) }; render(); }
+  finally { FOLDER.busy = false; folderButton(); }
+}
 async function loadFiles(files) {
   files = [...files];
   if (!files.length) return;
@@ -1310,6 +1390,7 @@ function bindDrop(el) {
 document.body.addEventListener('dragover', e => e.preventDefault());
 document.body.addEventListener('drop', e => { e.preventDefault(); if (!e.target.closest('#drop')) loadFiles(e.dataTransfer.files); });
 document.getElementById('btnLoad').onclick = () => document.getElementById('fileInput').click();
+document.getElementById('btnFolder').onclick = () => folderScan();
 document.getElementById('fileInput').onchange = e => { loadFiles(e.target.files); e.target.value = ''; };
 
 /* ---------- отрисовка ---------- */
@@ -1400,7 +1481,8 @@ document.getElementById('fAcc').onchange = e => { state.acc = e.target.value; re
 document.getElementById('fFrom').onchange = e => { state.from = e.target.value; render(); };
 document.getElementById('fTo').onchange = e => { state.to = e.target.value; render(); };
 if (window.Chart) { Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif"; }
-reload().then(() => { render(); return Promise.all([loadIssSwap(), loadIssBonds()]); }).then(ch => { if (ch.some(Boolean)) { M = model(); render(); } }).catch(err => { document.getElementById('view').innerHTML = `<div class="empty">Не удалось открыть хранилище браузера: ${err}</div>`; });
+reload().then(() => { render(); return Promise.all([loadIssSwap(), loadIssBonds()]); }).then(ch => { if (ch.some(Boolean)) { M = model(); render(); } })
+  .then(() => folderInit()).then(() => { if (FOLDER.handle && FOLDER.perm === 'granted') return folderScan(); }).catch(err => { document.getElementById('view').innerHTML = `<div class="empty">Не удалось открыть хранилище браузера: ${err}</div>`; });
 </script>
 </body>
 </html>
