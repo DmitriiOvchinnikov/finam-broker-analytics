@@ -885,19 +885,21 @@ function grouped(sel, g) {
 V.summary = (el, sel) => {
   const t = totals(sel), yr = t.calDays ? 365 / t.calDays : 0;
   const pct = v => !t.avgEq ? '' : t.calDays >= 30 ? fmt(v / t.avgEq * yr * 100, 1) + '% годовых' : 'годовые — от 30 дней данных';
+  // доходность от средней стоимости счёта: у рынков — до затрат и налогов, поэтому в сумме с ними даёт доходность прибыли
+  const ret = v => `${fmt(t.avgEq ? v / t.avgEq * 100 : NaN, 2)}% за период · ${pct(v)}`;
   const money = (v, neg) => `<span class="${neg ? 'neg' : sign(v)}">${neg && v ? '−' : v < 0 ? '−' : ''}${fmt(Math.abs(v))} ₽</span>`;
   const perAcc = sel.length > 1 ? sel.map(s => ({ acc: s.acc, t: totals([s]) })) : [];
   el.innerHTML = `
     <div class="grid kpis onerow" style="--n:${t.gap ? 8 : 7}">
       ${kpi('Стоимость счёта', fmt(t.equity) + ' ₽', 'на ' + (t.to ? ddmm(t.to) : '—'), 'big')}
-      ${kpi('Прибыль', money(t.pnl), `${fmt(t.avgEq ? t.pnl / t.avgEq * 100 : NaN, 2)}% за период · ${pct(t.pnl)}`)}
+      ${kpi('Прибыль', money(t.pnl), ret(t.pnl))}
       ${kpi('Затраты', money(t.costs, true), `${t.gross > 0 ? fmt(t.costs / t.gross * 100, 1) + '% от прибыли до затрат' : 'прибыль до затрат отрицательная'} · ${pct(t.costs)}`, 'bad')}
       ${kpi('Налоги', money(t.tax, true), 'уплачено и удержано', t.tax ? 'bad' : '')}
       ${kpi('Ввод и вывод денег', `${t.external > 0 ? '+' : t.external < 0 ? '−' : ''}${fmt(Math.abs(t.external || 0))} ₽`, 'внешние, в прибыль не входят')}
       ${kpi('Переводы между счетами', `${t.transfers > 0 ? '+' : t.transfers < 0 ? '−' : ''}${fmt(Math.abs(t.transfers || 0))} ₽`, sel.length > 1 ? 'между загруженными счетами гасятся' : 'в прибыль не входят')}
       ${t.gap ? kpi('Пропущенные дни', money(t.gap), 'изменение счёта за дни без справок — не разложено на рынки и затраты', 'bad') : ''}
-      ${kpi('Фондовый рынок и прочее', money(t.stock), 'бумаги, купоны, дивиденды, денежные фонды')}
-      ${kpi('Срочный рынок', money(t.vm), `вариационная маржа · в т.ч. фандинг ${t.funding < 0 ? '−' : ''}${fmt(Math.abs(t.funding))} ₽${fundingGaps(sel)}`)}
+      ${kpi('Фондовый рынок и прочее', money(t.stock), `${ret(t.stock)} · бумаги, купоны, дивиденды, денежные фонды`)}
+      ${kpi('Срочный рынок', money(t.vm), `${ret(t.vm)} · вариационная маржа · в т.ч. фандинг ${t.funding < 0 ? '−' : ''}${fmt(Math.abs(t.funding))} ₽${fundingGaps(sel)}`)}
     </div>
     <p class="note">Прибыль — изменение стоимости счёта без ввода, вывода и переводов денег. Она складывается из срочного рынка (вариационная маржа, уже с фандингом) и фондового рынка и прочего (переоценка и продажа бумаг, купоны, дивиденды, денежные фонды) за вычетом затрат и налогов. Фондовый рынок считается остатком, поэтому в него попадают и пропущенные дни.</p>
     ${perAcc.length ? `<div class="tbl" style="margin-bottom:18px"><table><thead><tr><th>Счёт</th><th class="n">Стоимость счёта</th><th class="n">Прибыль</th><th class="n">% годовых</th><th class="n">Затраты</th><th class="n">Налоги</th><th class="n">Фондовый и прочее</th><th class="n">Срочный рынок</th><th class="n">в т.ч. фандинг</th></tr></thead><tbody>
@@ -913,12 +915,13 @@ V.summary = (el, sel) => {
   const gcost = k => Object.values(G.P[k].costs).reduce((a, b) => a + b, 0);
   // затраты в другом масштабе — линией по правой оси
   const op = baseOpts(false);
-  op.scales.y2 = { position: 'right', beginAtZero: true, max: 0, grid: { display: false }, title: { display: true, text: 'затраты, ₽', color: css('--c4') }, ticks: { color: css('--c4'), callback: v => fmtAxis(v) } };
+  op.scales.y2 = { position: 'right', beginAtZero: true, max: 0, reverse: true, grid: { display: false }, title: { display: true, text: 'затраты, ₽', color: css('--c4') }, ticks: { color: css('--c4'), callback: v => fmtAxis(v) } };
   op.plugins.tooltip.callbacks.label = c => c.dataset.yAxisID === 'y2' ? `Затраты: ${fmt(c.parsed.y)} ₽` : `Прибыль: ${fmt(c.parsed.y)} ₽`;
   // прибыль — левая ось, первая в легенде и зелёная (у столбцов цвет по знаку, легенда иначе взяла бы цвет первого столбца)
   op.scales.y.ticks.color = css('--gain');
   op.scales.y.title = { display: true, text: 'прибыль, ₽', color: css('--gain') };
   op.plugins.legend.labels.generateLabels = ch => Chart.defaults.plugins.legend.labels.generateLabels(ch)
+    .sort((a, b) => a.datasetIndex - b.datasetIndex)
     .map(l => l.datasetIndex === 0 ? { ...l, fillStyle: css('--gain'), strokeStyle: css('--gain') } : l);
   chart(document.getElementById('cPnl'), { type: 'bar', options: op, data: { labels: G.keys.map(k => periodLabel(k, state.group)), datasets: [
     { label: 'Прибыль (левая ось)', data: G.keys.map(k => G.P[k].pnl), backgroundColor: G.keys.map(k => G.P[k].pnl >= 0 ? css('--gain') : css('--loss')), order: 1 },
