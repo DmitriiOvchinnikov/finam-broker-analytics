@@ -908,6 +908,12 @@ function totals(sel) {
   const eqByDate = {}; for (const s of sel) for (const d of s.days) if (isFinite(d.equity)) eqByDate[d.date] = (eqByDate[d.date] || 0) + d.equity;
   const eqs = Object.values(eqByDate); t.avgEq = eqs.length ? eqs.reduce((a, b) => a + b, 0) / eqs.length : 0;
   t.from = allDates[0]; t.to = allDates.at(-1);
+  // годовые: величина за период × 365 / дней. У нескольких счетов справки могут начинаться в разные дни — тогда
+  // средний капитал и годовые считаются по каждому счёту за его собственные дни и складываются
+  t.parts = sel.length > 1 ? sel.map(s => totals([s])) : null;
+  if (t.parts) t.avgEq = t.parts.reduce((a, p) => a + p.avgEq, 0);
+  t.minCal = t.parts ? Math.min(...t.parts.map(p => p.calDays)) : t.calDays;
+  t.ann = f => t.parts ? t.parts.reduce((a, p) => a + (p.calDays ? f(p) * 365 / p.calDays : 0), 0) : t.calDays ? f(t) * 365 / t.calDays : 0;
   // прибыль = срочный рынок (ВМ) + фондовый рынок и прочее − затраты − налоги; «фондовый и прочее» — остаток
   t.gross = t.pnl + t.costs + t.tax; t.stock = t.gross - t.vm - (t.gap || 0);
   return t;
@@ -926,25 +932,25 @@ function grouped(sel, g) {
 }
 
 V.summary = (el, sel) => {
-  const t = totals(sel), yr = t.calDays ? 365 / t.calDays : 0;
-  const pct = v => !t.avgEq ? '' : t.calDays >= 30 ? fmt(v / t.avgEq * yr * 100, 1) + '% годовых' : 'годовые — от 30 дней данных';
+  const t = totals(sel);
+  const pct = f => !t.avgEq ? '' : t.minCal >= 30 ? fmt(t.ann(f) / t.avgEq * 100, 1) + '% годовых' : 'годовые — от 30 дней данных';
   // доходность от средней стоимости счёта: у рынков — до затрат и налогов, поэтому в сумме с ними даёт доходность прибыли
-  const ret = v => `${fmt(t.avgEq ? v / t.avgEq * 100 : NaN, 2)}% за период · ${pct(v)}`;
+  const ret = f => `${fmt(t.avgEq ? f(t) / t.avgEq * 100 : NaN, 2)}% за период · ${pct(f)}`;
   const money = (v, neg) => `<span class="${neg ? 'neg' : sign(v)}">${neg && v ? '−' : v < 0 ? '−' : ''}${fmt(Math.abs(v))} ₽</span>`;
   const perAcc = sel.length > 1 ? sel.map(s => ({ acc: s.acc, t: totals([s]) })) : [];
   el.innerHTML = `
     <div class="grid kpis onerow" style="--n:${t.gap ? 8 : 7}">
       ${kpi('Стоимость счёта', fmt(t.equity) + ' ₽', 'на ' + (t.to ? ddmm(t.to) : '—'), 'big')}
-      ${kpi('Прибыль', money(t.pnl), ret(t.pnl))}
-      ${kpi('Затраты', money(t.costs, true), `${t.gross > 0 ? fmt(t.costs / t.gross * 100, 1) + '% от прибыли до затрат' : 'прибыль до затрат отрицательная'} · ${pct(t.costs)}`, 'bad')}
+      ${kpi('Прибыль', money(t.pnl), ret(a => a.pnl))}
+      ${kpi('Затраты', money(t.costs, true), `${t.gross > 0 ? fmt(t.costs / t.gross * 100, 1) + '% от прибыли до затрат' : 'прибыль до затрат отрицательная'} · ${pct(a => a.costs)}`, 'bad')}
       ${kpi('Налоги', money(t.tax, true), 'уплачено и удержано', t.tax ? 'bad' : '')}
       ${kpi('Ввод и вывод денег', `${t.external > 0 ? '+' : t.external < 0 ? '−' : ''}${fmt(Math.abs(t.external || 0))} ₽`, 'внешние, в прибыль не входят')}
       ${kpi('Переводы между счетами', `${t.transfers > 0 ? '+' : t.transfers < 0 ? '−' : ''}${fmt(Math.abs(t.transfers || 0))} ₽`, sel.length > 1 ? 'между загруженными счетами гасятся' : 'в прибыль не входят')}
       ${t.gap ? kpi('Пропущенные дни', money(t.gap), 'изменение счёта за дни без справок — не разложено на рынки и затраты', 'bad') : ''}
-      ${kpi('Фондовый рынок и прочее', money(t.stock), `${ret(t.stock)} · бумаги, купоны, дивиденды, денежные фонды`)}
-      ${kpi('Срочный рынок', money(t.vm), `${ret(t.vm)} · вариационная маржа · в т.ч. фандинг ${t.funding < 0 ? '−' : ''}${fmt(Math.abs(t.funding))} ₽${fundingGaps(sel)}`)}
+      ${kpi('Фондовый рынок и прочее', money(t.stock), `${ret(a => a.stock)} · бумаги, купоны, дивиденды, денежные фонды`)}
+      ${kpi('Срочный рынок', money(t.vm), `${ret(a => a.vm)} · вариационная маржа · в т.ч. фандинг ${t.funding < 0 ? '−' : ''}${fmt(Math.abs(t.funding))} ₽${fundingGaps(sel)}`)}
     </div>
-    <p class="note">Прибыль — изменение стоимости счёта без ввода, вывода и переводов денег. Она складывается из срочного рынка (вариационная маржа, уже с фандингом) и фондового рынка и прочего (переоценка и продажа бумаг, купоны, дивиденды, денежные фонды) за вычетом затрат и налогов. Фондовый рынок считается остатком, поэтому в него попадают и пропущенные дни.</p>
+    <p class="note">Прибыль — изменение стоимости счёта без ввода, вывода и переводов денег. Она складывается из срочного рынка (вариационная маржа, уже с фандингом) и фондового рынка и прочего (переоценка и продажа бумаг, купоны, дивиденды, денежные фонды) за вычетом затрат и налогов. Фондовый рынок считается остатком, поэтому в него попадают и пропущенные дни.${perAcc.length ? ' Проценты по нескольким счетам: средний капитал и годовые прибыль и затраты считаются по каждому счёту за дни его справок и складываются — справки по счетам могут начинаться в разные дни.' : ''} Проценты здесь простые, от среднего капитала; со сложным процентом — на вкладке «Доходность».</p>
     ${perAcc.length ? `<div class="tbl" style="margin-bottom:18px"><table><thead><tr><th>Счёт</th><th class="n">Стоимость счёта</th><th class="n">Прибыль</th><th class="n">% годовых</th><th class="n">Затраты</th><th class="n">Налоги</th><th class="n">Фондовый и прочее</th><th class="n">Срочный рынок</th><th class="n">в т.ч. фандинг</th></tr></thead><tbody>
       ${perAcc.map(({ acc, t: a }) => `<tr><td>${esc(acc)}</td><td class="n">${fmt(a.equity)}</td><td class="n ${sign(a.pnl)}">${fmt(a.pnl)}</td><td class="n">${a.avgEq && a.calDays >= 30 ? fmt(a.pnl / a.avgEq * 365 / a.calDays * 100, 1) + '%' : '—'}</td><td class="n neg">${a.costs ? '−' + fmt(a.costs) : '0'}</td><td class="n ${a.tax ? 'neg' : ''}">${a.tax ? '−' + fmt(a.tax) : '0'}</td><td class="n ${sign(a.stock)}">${fmt(a.stock)}</td><td class="n ${sign(a.vm)}">${fmt(a.vm)}</td><td class="n ${sign(a.funding)}">${fmt(a.funding)}</td></tr>`).join('')}
     </tbody></table></div>` : ''}
@@ -990,8 +996,13 @@ V.summary = (el, sel) => {
 // (половина суммы в капитале). Индекс — произведение (1 + доходность) по дням, как у фонда: ввод и вывод его не двигают.
 // Пропуск справок — одна доходность за весь пропуск от последней известной стоимости; справка за период — одна за период.
 function returnSeries(sel) {
+  // индекс портфеля без справок по одному из счетов не посчитать: его капитал в эти дни неизвестен.
+  // Поэтому по нескольким счетам — только дни от самого позднего начала до самого раннего конца
+  const span = sel.filter(s => s.days.length).map(s => ({ acc: s.acc, from: s.days[0].date, to: s.days.at(-1).date }));
+  const from = span.reduce((a, x) => x.from > a ? x.from : a, ''), to = span.reduce((a, x) => !a || x.to < a ? x.to : a, '');
   const by = {};
   for (const s of sel) for (const d of s.days) {
+    if (d.date < from || d.date > to) continue;
     const x = by[d.date] || (by[d.date] = { date: d.date, pnl: 0, base: 0, vm: 0, stock: 0, costs: 0, tax: 0, gap: 0, go: 0, eq: 0, eqOk: true, partial: false, lump: false });
     const pnl = d.pnl + (d.gapPnl || 0), costs = sumCosts(d);
     x.pnl += pnl; x.gap += d.gapPnl || 0; if (isFinite(d.go)) x.go += d.go; x.vm += d.vm; x.costs += costs; x.tax += d.tax; x.stock += d.pnl + costs + d.tax - d.vm;
@@ -1011,6 +1022,8 @@ function returnSeries(sel) {
     x.dd = idx / peak - 1; x.peakDate = peakDate;
     cumPeak = Math.max(cumPeak, cum); x.ddRub = cum - cumPeak;
   }
+  if (span.length > 1) out.cut = { from, to, late: span.filter(x => x.from < from).length ? span.filter(x => x.from === from).map(x => x.acc) : [],
+    early: span.filter(x => x.to > to).length ? span.filter(x => x.to === to).map(x => x.acc) : [] };
   return out;
 }
 function returnStats(xs) {
@@ -1051,7 +1064,8 @@ function returnStats(xs) {
 }
 V.returns = (el, sel) => {
   const xs = returnSeries(sel);
-  if (!xs.length) { el.innerHTML = '<div class="empty">Нет данных за выбранный период.</div>'; return; }
+  if (!xs.length) { el.innerHTML = `<div class="empty">${sel.length > 1 ? 'Нет дней, за которые есть справки по всем выбранным счетам.' : 'Нет данных за выбранный период.'}</div>`; return; }
+  const cut = xs.cut && (xs.cut.late.length || xs.cut.early.length) ? xs.cut : null;
   const st = returnStats(xs), log = !!state.retLog, pctMode = state.retUnit === 'pct', split = !!state.retSplit, grp = state.retGrp || 'day', last = xs.at(-1);
   const P = (v, d = 2) => isFinite(v) ? `<span class="${sign(v)}">${fmt(v * 100, d)}%</span>` : '—';
   const days = n => `${fmt(n)} ${n % 10 === 1 && n % 100 !== 11 ? 'день' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'дня' : 'дней'}`;
@@ -1073,7 +1087,9 @@ V.returns = (el, sel) => {
     let pk = 1, g = 1, mdd = 0; for (const x of Y[y].xs) { g *= 1 + x.r; pk = Math.max(pk, g); mdd = Math.min(mdd, g / pk - 1); }
     return [y, { mdd, st: returnStats(Y[y].xs.map((x, i, a) => ({ ...x, idx: a.slice(0, i + 1).reduce((p, z) => p * (1 + z.r), 1) }))) }];
   }));
+  const accs = a => a.map(esc).join(', ');
   el.innerHTML = `
+    ${cut ? `<p class="note"><span class="warn">По всем счетам вместе — только ${ddmm(cut.from)}–${ddmm(cut.to)}, дни, за которые есть справки по каждому счёту${cut.late.length ? `: по ${accs(cut.late)} раньше ${ddmm(cut.from)} справок нет` : ''}${cut.early.length ? `${cut.late.length ? ',' : ':'} по ${accs(cut.early)} после ${ddmm(cut.to)} справок нет` : ''}.</span> Без них капитал портфеля в остальные дни неизвестен. Каждый счёт за весь его период — при выборе счёта.</p>` : ''}
     <div class="grid kpis">
       ${kpi('Доходность за период', P(st.total), `без влияния ввода и вывода · ${days(Math.round(st.cal))}`)}
       ${kpi('Среднегодовая', short ? '—' : P(st.cagr, 1), short ? 'от 90 дней данных: на коротком сроке сложный процент раздувает цифру' : 'с учётом сложного процента')}
@@ -1148,7 +1164,7 @@ V.returns = (el, sel) => {
 };
 
 V.costs = (el, sel) => {
-  const t = totals(sel), G = grouped(sel, state.group), yr = t.calDays ? 365 / t.calDays : 0;
+  const t = totals(sel), G = grouped(sel, state.group);
   const ks = COST_KEYS.filter(k => Math.abs(t.byCost[k[0]]) > 0.5);
   el.innerHTML = `
     <p class="note">Все суммы — фактические списания из справок. Брокерская комиссия за сделки разделена на срочный и фондовый рынок по выведенной ставке за контракт (вкладка «Ставки и сверка»). Ежемесячная плата отнесена к концу оплаченного периода, а не к дню списания.</p>
@@ -1157,10 +1173,10 @@ V.costs = (el, sel) => {
     <div class="tbl"><table><thead><tr><th>Статья</th><th class="n">Сумма, ₽</th><th class="n">Доля</th><th class="n">₽ на лот</th><th class="n">% годовых от счёта</th>
       ${G.keys.map(k => `<th class="n">${periodLabel(k, state.group)}</th>`).join('')}</tr></thead><tbody>
       ${ks.map(k => `<tr><td>${k[1]}</td>${costTd(t.byCost[k[0]])}<td class="n">${fmt(t.byCost[k[0]] / t.costs * 100, 1)}%</td>
-        <td class="n">${t.lots ? fmt(t.byCost[k[0]] / t.lots, 3) : '—'}</td><td class="n">${fmt(t.avgEq ? t.byCost[k[0]] / t.avgEq * yr * 100 : NaN, 2)}%</td>
+        <td class="n">${t.lots ? fmt(t.byCost[k[0]] / t.lots, 3) : '—'}</td><td class="n">${fmt(t.avgEq ? t.ann(a => a.byCost[k[0]]) / t.avgEq * 100 : NaN, 2)}%</td>
         ${G.keys.map(p => costTd(G.P[p].costs[k[0]] || 0)).join('')}</tr>`).join('')}
       <tr class="tot"><td>Итого</td>${costTd(t.costs)}<td class="n">100%</td><td class="n">${t.lots ? fmt(t.costs / t.lots, 3) : '—'}</td>
-        <td class="n">${fmt(t.avgEq ? t.costs / t.avgEq * yr * 100 : NaN, 2)}%</td>
+        <td class="n">${fmt(t.avgEq ? t.ann(a => a.costs) / t.avgEq * 100 : NaN, 2)}%</td>
         ${G.keys.map(p => costTd(Object.values(G.P[p].costs).reduce((a, b) => a + b, 0))).join('')}</tr>
     </tbody></table></div>
     <h2>Движения денег и налоги</h2>
