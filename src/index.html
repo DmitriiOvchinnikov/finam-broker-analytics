@@ -97,6 +97,7 @@ tr.tot td { font-weight: 600; background: var(--surface2); }
 .infobox h2 { margin-top: 0; }
 .infobox ul { margin: 4px 0 0 18px; }
 .hide { display: none !important; }
+.dim { color: var(--dim); font-size: 12px; }
 .posgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; margin-bottom: 8px; }
 .poscell { display: flex; justify-content: space-between; gap: 8px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface2); font-size: 13px; }
 .poscell b { font: 500 13px 'IBM Plex Mono', monospace; }
@@ -134,6 +135,7 @@ footer a { color: var(--dim); }
 </header>
 <nav id="tabs">
   <button data-t="summary" class="on">Сводка</button>
+  <button data-t="returns">Доходность</button>
   <button data-t="costs">Затраты</button>
   <button data-t="rates">Ставки и сверка</button>
   <button data-t="instr">Срочный рынок</button>
@@ -976,6 +978,140 @@ V.summary = (el, sel) => {
       plugins: { legend: { position: 'right', labels: { color: css('--dim'), boxWidth: 12 } },
                  tooltip: { callbacks: { label: c => c.label } } } },
     data: { labels: ks.map(k => `${k[1]}: −${fmt(t.byCost[k[0]])} ₽ · ${fmt(t.byCost[k[0]] / t.costs * 100, 1)}%`), datasets: [{ data: ks.map(k => t.byCost[k[0]]), backgroundColor: ks.map(k => css(COLORS[COST_KEYS.indexOf(k)])), borderColor: css('--surface') }] } });
+};
+
+/* ---------- доходность: индекс без влияния ввода и вывода, просадки, Шарп ---------- */
+// Доходность дня = прибыль дня / капитал на начало дня; ввод и вывод дня считаются пришедшими в середине дня
+// (половина суммы в капитале). Индекс — произведение (1 + доходность) по дням, как у фонда: ввод и вывод его не двигают.
+// Пропуск справок — одна доходность за весь пропуск от последней известной стоимости; справка за период — одна за период.
+function returnSeries(sel) {
+  const by = {};
+  for (const s of sel) for (const d of s.days) {
+    const x = by[d.date] || (by[d.date] = { date: d.date, pnl: 0, base: 0, vm: 0, stock: 0, costs: 0, tax: 0, eq: 0, eqOk: true, partial: false, lump: false });
+    const pnl = d.pnl + (d.gapPnl || 0), costs = sumCosts(d);
+    x.pnl += pnl; x.vm += d.vm; x.costs += costs; x.tax += d.tax; x.stock += d.pnl + costs + d.tax - d.vm;
+    const start = d.gapPnl ? d.equityStart - d.gapPnl : d.equityStart;
+    if (isFinite(start)) x.base += start + d.flowsIn / 2;
+    if (isFinite(d.equity)) x.eq += d.equity; else x.eqOk = false;
+    if (d.partial) { x.partial = true; if (d.r.period?.last) x.lump = true; }
+    if (d.gapPnl) x.lump = true;
+  }
+  const out = Object.values(by).sort((a, b) => a.date.localeCompare(b.date));
+  let idx = 1, cum = 0, cumVm = 0, cumStock = 0, peak = 1, peakDate = out[0]?.date, cumPeak = 0;
+  for (const x of out) {
+    x.r = x.base > 0 ? x.pnl / x.base : 0; idx *= 1 + x.r; x.idx = idx;
+    x.rVm = x.base > 0 ? x.vm / x.base : 0; x.rStock = x.base > 0 ? x.stock / x.base : 0;
+    cum += x.pnl; cumVm += x.vm; cumStock += x.stock; x.cum = cum; x.cumVm = cumVm; x.cumStock = cumStock;
+    if (idx >= peak) { peak = idx; peakDate = x.date; }
+    x.dd = idx / peak - 1; x.peakDate = peakDate;
+    cumPeak = Math.max(cumPeak, cum); x.ddRub = cum - cumPeak;
+  }
+  return out;
+}
+function returnStats(xs) {
+  const st = { n: xs.length };
+  if (!xs.length) return st;
+  const cal = (Date.parse(xs.at(-1).date) - Date.parse(xs[0].date)) / 864e5 + 1;
+  st.total = xs.at(-1).idx - 1; st.cal = cal; st.cagr = cal >= 90 ? Math.pow(xs.at(-1).idx, 365 / cal) - 1 : NaN;
+  st.pnl = xs.at(-1).cum;
+  // наибольшая просадка индекса (в %), её вершина и дно; длительность — от вершины до восстановления (или до конца данных)
+  let mdd = 0, mi = -1; xs.forEach((x, i) => { if (x.dd < mdd) { mdd = x.dd; mi = i; } });
+  st.mdd = mdd;
+  if (mi >= 0) {
+    st.mddPeak = xs[mi].peakDate; st.mddBottom = xs[mi].date;
+    const rec = xs.slice(mi).find(x => x.dd >= -1e-12); st.mddRecovered = rec ? rec.date : null;
+  }
+  // самая долгая просадка: от вершины до первого дня, когда индекс снова её достиг; незакрытая — до конца данных
+  let longest = 0, lp = null, le = null, open = false, start = null;
+  for (const x of xs) {
+    if (x.dd < -1e-12) { if (!start) start = x.peakDate; }
+    else if (start) { const len = (Date.parse(x.date) - Date.parse(start)) / 864e5; if (len > longest) { longest = len; lp = start; le = x.date; open = false; } start = null; }
+  }
+  if (start) { const len = (Date.parse(xs.at(-1).date) - Date.parse(start)) / 864e5; if (len > longest) { longest = len; lp = start; le = xs.at(-1).date; open = true; } }
+  st.ddLen = longest; st.ddLenFrom = lp; st.ddLenTo = le; st.ddLenOpen = open;
+  // наибольшая просадка накопленной прибыли в рублях и фактор восстановления = прибыль / эта просадка
+  st.mddRub = Math.min(0, ...xs.map(x => x.ddRub)); st.recovery = st.mddRub < 0 ? st.pnl / -st.mddRub : NaN;
+  // Шарп и Сортино — по дневным доходностям, без дней справок за период и пропусков (там одна доходность на много дней);
+  // безрисковая ставка 0; в год — по фактическому числу торговых дней в году данных
+  const rs = xs.filter(x => !x.lump && !x.partial).map(x => x.r);
+  st.nr = rs.length;
+  if (rs.length >= 20 && cal >= 30) {
+    const m = rs.reduce((a, b) => a + b, 0) / rs.length, sd = Math.sqrt(rs.reduce((a, b) => a + (b - m) ** 2, 0) / (rs.length - 1));
+    const down = Math.sqrt(rs.reduce((a, b) => a + Math.min(0, b) ** 2, 0) / rs.length), perYear = rs.length / (cal / 365);
+    st.sharpe = sd > 0 ? m / sd * Math.sqrt(perYear) : NaN; st.sortino = down > 0 ? m / down * Math.sqrt(perYear) : NaN;
+    st.vol = sd * Math.sqrt(perYear); st.perYear = perYear;
+    st.best = Math.max(...rs); st.worst = Math.min(...rs); st.winDays = rs.filter(r => r > 0).length / rs.length;
+  }
+  return st;
+}
+V.returns = (el, sel) => {
+  const xs = returnSeries(sel);
+  if (!xs.length) { el.innerHTML = '<div class="empty">Нет данных за выбранный период.</div>'; return; }
+  const st = returnStats(xs), log = !!state.retLog;
+  const P = (v, d = 2) => isFinite(v) ? `<span class="${sign(v)}">${fmt(v * 100, d)}%</span>` : '—';
+  const days = n => `${fmt(n)} ${n % 10 === 1 && n % 100 !== 11 ? 'день' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'дня' : 'дней'}`;
+  const short = st.cal < 90;
+  // по месяцам и годам: доходность — произведение дневных, вклад рынков — сумма дневных
+  const M = {}, Y = {};
+  for (const x of xs) {
+    const ym = x.date.slice(0, 7), y = x.date.slice(0, 4);
+    for (const [K, k] of [[M, ym], [Y, y]]) {
+      const a = K[k] || (K[k] = { g: 1, vm: 0, stock: 0, pnl: 0, costs: 0, tax: 0, xs: [], inPeriod: true, lump: [] });
+      if (!x.partial || x.lump) a.inPeriod = false;
+      if (x.partial && x.lump) a.lump.push(x.date);
+      a.g *= 1 + x.r; a.vm += x.rVm; a.stock += x.rStock; a.pnl += x.pnl; a.costs += x.costs; a.tax += x.tax; a.xs.push(x);
+    }
+  }
+  const years = Object.keys(Y).sort(), mon = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+  const yStats = Object.fromEntries(years.map(y => {
+    // просадка внутри года — от максимума этого года
+    let pk = 1, g = 1, mdd = 0; for (const x of Y[y].xs) { g *= 1 + x.r; pk = Math.max(pk, g); mdd = Math.min(mdd, g / pk - 1); }
+    return [y, { mdd, st: returnStats(Y[y].xs.map((x, i, a) => ({ ...x, idx: a.slice(0, i + 1).reduce((p, z) => p * (1 + z.r), 1) }))) }];
+  }));
+  el.innerHTML = `
+    <div class="grid kpis">
+      ${kpi('Доходность за период', P(st.total), `без влияния ввода и вывода · ${days(Math.round(st.cal))}`)}
+      ${kpi('Среднегодовая', short ? '—' : P(st.cagr, 1), short ? 'от 90 дней данных: на коротком сроке сложный процент раздувает цифру' : 'с учётом сложного процента')}
+      ${kpi('Наибольшая просадка', P(st.mdd), st.mddPeak ? `${ddmm(st.mddPeak)} → ${ddmm(st.mddBottom)} · ${st.mddRecovered ? 'восстановлена ' + ddmm(st.mddRecovered) : 'не восстановлена'}` : 'просадок не было', st.mdd < 0 ? 'bad' : '')}
+      ${kpi('Самая долгая просадка', st.ddLen ? days(Math.round(st.ddLen)) : '—', st.ddLen ? `${ddmm(st.ddLenFrom)} → ${ddmm(st.ddLenTo)}${st.ddLenOpen ? ' · ещё идёт' : ''}` : 'от вершины до восстановления')}
+      ${kpi('Коэффициент Шарпа', isFinite(st.sharpe) ? fmt(st.sharpe, 2) : '—', isFinite(st.sharpe) ? `годовой, по ${st.nr} дн. · без безрисковой ставки · Сортино ${fmt(st.sortino, 2)}` : 'от 20 дней и 30 календарных дней данных')}
+      ${kpi('Фактор восстановления', isFinite(st.recovery) ? fmt(st.recovery, 2) : '—', isFinite(st.recovery) ? `прибыль ${fmt(st.pnl)} ₽ / просадка ${fmt(-st.mddRub)} ₽` : 'нет просадки')}
+    </div>
+    ${isFinite(st.vol) ? `<p class="note">Волатильность ${fmt(st.vol * 100, 1)}% годовых · лучший день ${P(st.best)} · худший ${P(st.worst)} · дней в плюс ${fmt(st.winDays * 100, 0)}%.</p>` : ''}
+    <p class="note">Доходность дня = прибыль дня / стоимость счёта на начало дня (ввод и вывод дня — наполовину), индекс — произведение дневных доходностей, как у фонда: ввод и вывод денег на него не влияют. Просадка — от предыдущего максимума индекса. Длительность просадки — от вершины до дня, когда индекс снова её достиг. Шарп и Сортино — по дневным доходностям, в год по фактическому числу торговых дней; безрисковая ставка не вычитается. Фактор восстановления — прибыль за период в рублях, делённая на наибольшую просадку накопленной прибыли в рублях. Пропуски справок и справки за период дают одну доходность на много дней — в Шарп они не входят.</p>
+    <div class="grid two">
+      <div><h2>Индекс доходности <span class="seg" id="retLog" style="margin-left:8px;vertical-align:middle"><button data-l="0" class="${log ? '' : 'on'}">обычная</button><button data-l="1" class="${log ? 'on' : ''}">логарифмическая</button></span></h2><div class="chart tall"><canvas id="cRetIdx"></canvas></div></div>
+      <div><h2>Просадка от максимума</h2><div class="chart tall"><canvas id="cRetDd"></canvas></div></div>
+    </div>
+    <h2>Накопленный вклад рынков</h2>
+    <p class="note">Сумма дневных доходностей: срочный и фондовый рынок — до затрат и налогов, счёт — после них.</p>
+    <div class="chart"><canvas id="cRetMk"></canvas></div>
+    <h2>По годам</h2>
+    <div class="tbl"><table><thead><tr><th>Год</th><th class="n">Доходность</th><th class="n">Прибыль, ₽</th><th class="n">Срочный, %</th><th class="n">Фондовый, %</th><th class="n">Затраты, ₽</th><th class="n">Налоги, ₽</th><th class="n">Просадка</th><th class="n">Шарп</th><th class="n">Дней</th></tr></thead><tbody>
+      ${years.map(y => `<tr><td>${y}</td><td class="n">${P(Y[y].g - 1)}</td><td class="n ${sign(Y[y].pnl)}">${fmt(Y[y].pnl)}</td><td class="n">${P(Y[y].vm)}</td><td class="n">${P(Y[y].stock)}</td>${costTd(Y[y].costs)}${costTd(Y[y].tax)}<td class="n">${P(yStats[y].mdd)}</td><td class="n">${isFinite(yStats[y].st.sharpe) ? fmt(yStats[y].st.sharpe, 2) : '—'}</td><td class="n">${Y[y].xs.length}</td></tr>`).join('')}
+    </tbody></table></div>
+    <h2>По месяцам</h2>
+    <div class="tbl"><table><thead><tr><th>Год</th>${mon.map(m => `<th class="n">${m}</th>`).join('')}<th class="n">Год</th></tr></thead><tbody>
+      ${years.map(y => `<tr><td>${y}</td>${mon.map((m, i) => { const a = M[`${y}-${String(i + 1).padStart(2, '0')}`]; return `<td class="n">${!a ? '' : a.inPeriod ? '<span class="dim" title="месяц внутри справки за период: доходность по месяцам в ней не видна">в периоде</span>' : P(a.g - 1, 1) + (a.lump.length ? '*' : '')}</td>`; }).join('')}<td class="n"><b>${P(Y[y].g - 1, 1)}</b></td></tr>`).join('')}
+    </tbody></table></div>
+    ${Object.values(M).some(a => a.lump.length) ? '<p class="note">* В месяце вся доходность справки за период: по месяцам внутри неё доходность не видна. Нужны месяцы — загрузите однодневные справки.</p>' : ''}`;
+  el.querySelectorAll('#retLog button').forEach(b => b.onclick = () => { state.retLog = b.dataset.l === '1'; render(); });
+  const labels = xs.map(x => periodLabel(x.date, 'day'));
+  const oi = baseOpts(false); oi.plugins.legend.display = false;
+  oi.scales.y.ticks.callback = v => fmt(v, 2); oi.plugins.tooltip.callbacks.label = c => `Индекс: ${fmt(c.parsed.y, 4)} (${fmt((c.parsed.y - 1) * 100, 2)}%)`;
+  if (log) oi.scales.y.type = 'logarithmic';
+  chart(document.getElementById('cRetIdx'), { type: 'line', options: oi, data: { labels, datasets: [
+    { label: 'Индекс', data: xs.map(x => x.idx), borderColor: css('--c1'), backgroundColor: css('--c1'), pointRadius: 0, borderWidth: 2 }] } });
+  const od = baseOpts(false); od.plugins.legend.display = false; od.scales.y.max = 0;
+  od.scales.y.ticks.callback = v => fmt(v, 0) + '%'; od.plugins.tooltip.callbacks.label = c => `Просадка: ${fmt(c.parsed.y, 2)}%`;
+  chart(document.getElementById('cRetDd'), { type: 'line', options: od, data: { labels, datasets: [
+    { label: 'Просадка', data: xs.map(x => x.dd * 100), borderColor: css('--loss'), backgroundColor: css('--loss') + '33', fill: 'origin', pointRadius: 0, borderWidth: 1.5 }] } });
+  const om = baseOpts(false); om.scales.y.ticks.callback = v => fmt(v, 0) + '%'; om.plugins.tooltip.callbacks.label = c => `${c.dataset.label}: ${fmt(c.parsed.y, 2)}%`;
+  let a1 = 0, a2 = 0, a3 = 0;
+  chart(document.getElementById('cRetMk'), { type: 'line', options: om, data: { labels, datasets: [
+    { label: 'Счёт, после затрат', data: xs.map(x => (a1 += x.r) * 100), borderColor: css('--c1'), backgroundColor: css('--c1'), pointRadius: 0, borderWidth: 2 },
+    { label: 'Срочный рынок', data: xs.map(x => (a2 += x.rVm) * 100), borderColor: css('--c3'), backgroundColor: css('--c3'), pointRadius: 0, borderWidth: 1.5 },
+    { label: 'Фондовый и прочее', data: xs.map(x => (a3 += x.rStock) * 100), borderColor: css('--c2'), backgroundColor: css('--c2'), pointRadius: 0, borderWidth: 1.5 }] } });
 };
 
 V.costs = (el, sel) => {
