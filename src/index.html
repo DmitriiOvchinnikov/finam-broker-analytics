@@ -152,7 +152,7 @@ footer a { color: var(--dim); }
 
 // Меняйте при любом изменении того, что разборщик достаёт из справки: старые разборы в браузере
 // пересчитать нельзя (исходные файлы не хранятся), страница попросит загрузить их заново.
-const PARSER_VERSION = 8;
+const PARSER_VERSION = 9;
 const DATE_RE = /^\d\d\.\d\d\.\d{4}$/;
 function num(x) {
   if (!x) return 0;
@@ -247,7 +247,10 @@ function parseReport(s) {
   for (const c of rows(section(s, 'Виды движений', ['Оценка позиции по Производным', 'Оценка позиции по ценным', '2. Движения']))) {
     if (c[0] === 'Рубль' && c.length >= 19)
       r.flows = { deposit: num(c[1]), withdraw: num(c[2]), vm: num(c[11]), goChange: num(c[12]), exch: num(c[13]),
-                  income: num(c[14]), broker: num(c[15]), tax: num(c[17]) + num(c[18]), other: num(c[19]) };
+                  income: num(c[14]), broker: num(c[15]), tax: num(c[17]) + num(c[18]), other: num(c[19]) },
+      // «Виды движений» целиком — для сверки: 1 ввод, 2 вывод, 3–6 продажи, 7–10 покупки, 11 ВМ, 12 ГО, 13 сбор,
+      // 14 дивиденды/НКД, 15 брокер, 16 инв. советник, 17 налог списан, 18 налог удержан при выплате, 19 иное
+      r.recon = { kinds: c.slice(0, 20).map(num), futVm: null, secFee: null };
   }
   // позиции по ПФИ: 7 ВМ факт (оплачена сегодня), 8 ВМ план (за этот торговый день), 10 позиция на конец
   for (const c of rows(section(s, 'Оценка позиции по Производным', ['ГО срочного рынка', 'Оценка позиции по ценным']))) {
@@ -317,12 +320,18 @@ function parseReport(s) {
 
   // сделки фондового рынка: 0 дата, 2 бумага, 4 вид, 5 кол-во, 9 сумма, 22 режим, 25 № сделки, 26 описание
   for (const c of rows(section(s, 'Торговые движения ценных бумаг', ['Торговые движения ПФИ']))) {
+    // строка ИТОГО: 14 — брокер и биржевой сбор по сделкам с бумагами вместе
+    if (r.recon && r.recon.secFee === null && c[2] === 'ИТОГО:' && c.length >= 15) r.recon.secFee = num(c[14]);
     if (c.length >= 26 && DATE_RE.test(c[0]) && c[1] && /Покупка|Продажа/.test(c[4]))
       // дата, вид, сумма без НКД, бумага, сторона, сумма с НКД, кол-во
       r.secTrades[c[25]] = [iso(c[0]), secClass(c[26]), Math.abs(num(c[9])), c[2], /Покупка/.test(c[4]) ? 1 : -1, Math.abs(num(c[10]) || num(c[9])), num(c[5])];
   }
   // сделки ПФИ, сводка по (дата оплаты, контракт): 5 кол-во, 9 сбор оплачен, 12 сбор в долге, 16 дата оплаты, 18 сумма, 24 комментарий
+  let futHead = false;
   for (const c of rows(section(s, 'Торговые движения ПФИ', []))) {
+    // ИТОГО таблицы сделок ПФИ (у неё в шапке 10 — «Вариационная маржа / Премия»): 10 — ВМ по сделкам и позициям за день
+    if (/^Вариационная маржа/.test(c[10] || '') && /Код/.test(c[3] || '')) futHead = true;
+    if (r.recon && futHead && r.recon.futVm === null && c[2] === 'ИТОГО:') r.recon.futVm = num(c[10]);
     if (c.length < 24 || !DATE_RE.test(c[0]) || !c[1] || !c[3]) continue;
     const pay = /^\d{4}-\d\d-\d\d$/.test(c[16]) ? c[16] : iso(c[16]);
     if (!pay) continue;
@@ -758,6 +767,33 @@ async function loadIssSwap() {
   }
   if (changed) try { localStorage.setItem('fba-iss-swap', JSON.stringify(ISS.swap)); } catch (e) { }
   return changed;
+}
+
+/* ---------- сверка с итогами брокера («Виды движений денежных средств») ---------- */
+// Каждая строка: что получилось из разобранных строк справки и что у брокера в итогах. Всё — до копейки.
+function reconcile(r) {
+  const k = r.recon?.kinds; if (!k) return null;
+  const sum = (a, f) => (a || []).reduce((t, x) => t + f(x), 0), cr = cls => sum(r.credits, x => cls.includes(x.cls) ? x.amount : 0);
+  const ident = r.money.in + k[1] - k[2] + k.slice(3, 12).reduce((a, b) => a + b, 0) + k[13] + k[14] + k[15] + k[16] + k[17] + k[19];
+  const rows = [
+    ['Остаток: вход + движения = выход', ident, r.money.out],
+    ['Ввод и вывод, переводы', sum(r.moves, m => m.amount), k[1] - k[2]],
+    ['Купоны и дивиденды', cr(['coupon', 'dividend']), k[14]],
+    ['Брокер: сделки + неторговые + РЕПО', -(r.tradeComm + sum(r.nontrade, n => n.amount) + (r.commRepo || 0)), k[15]],
+    ['Налоги уплаченные', -r.tax, k[17]],
+    ['Налоги, удержанные при выплате', -sum(r.credits, grossTax), k[18]],
+    ['Иное: проценты по займу бумаг − пени', cr(['lending', 'otherIncome']) - r.penalty, k[19]],
+  ];
+  if (r.hasTrades || r.recon.futVm !== null) {
+    rows.push(['Вариационная маржа', r.recon.futVm || 0, k[11]]);
+    // Сбор по сделкам с бумагами (ИТОГО их таблицы «брокер + сбор» минус брокер) в однодневной справке брокер добавляет
+    // к «Биржевым затратам», а в справке за период часть его уже входит в них — смотря по дате оплаты. Поэтому итог
+    // брокера должен лежать между «Биржевыми затратами» и ими же плюс весь сбор по бумагам.
+    const secExch = Math.max(0, (r.recon.secFee || 0) - (r.commSec || 0)), a = -r.exchPaid, b = -(r.exchPaid + secExch);
+    const inside = k[13] <= a + 0.015 && k[13] >= b - 0.015;
+    rows.push(['Биржевой сбор: срочный + фондовый', inside ? k[13] : Math.abs(a - k[13]) < Math.abs(b - k[13]) ? a : b, k[13]]);
+  }
+  return rows.map(([name, ours, broker]) => ({ name, ours, broker, ok: Math.abs(ours - broker) < 0.015 }));
 }
 
 /* ---------- выборка под фильтры ---------- */
@@ -1206,7 +1242,8 @@ V.data = (el) => {
     }
     const periods = rs.filter(r => r.dateTo && r.dateTo !== r.date);
     const brief = rs.filter(r => !r.hasTrades && r.nontrade.some(n => n.cls === 'brokerUnknown')).map(r => r.date);
-    return { a, rs, gaps, brief, periods, cd };
+    const rec = rs.map(r => ({ r, rows: reconcile(r) })).filter(x => x.rows), bad = rec.filter(x => x.rows.some(y => !y.ok));
+    return { a, rs, gaps, brief, periods, cd, rec, bad };
   });
   el.innerHTML = `
     <div class="drop" id="drop">
@@ -1235,7 +1272,13 @@ V.data = (el) => {
       <div class="chips"><span class="chip">${x.rs.length} справок</span>${x.periods.map(r => `<span class="chip warn">за период ${ddmm(r.date)}–${ddmm(r.dateTo)} <button class="x" title="удалить эту справку" data-delone="${esc(DB.key(r))}">×</button></span>`).join('')}<span class="chip ${x.rs.some(r => r.v !== PARSER_VERSION) ? 'warn' : ''}">разобрано версией ${[...new Set(x.rs.map(r => r.v || 1))].join(', ')}${x.rs.some(r => r.v !== PARSER_VERSION) ? ` — нужна ${PARSER_VERSION}` : ' (текущая)'}</span><span class="chip">${ddmm(x.cd[0])} … ${ddmm(x.cd.at(-1))}</span>
         ${x.gaps.length ? `<span class="chip warn">пропуски: ${x.gaps.join(', ')}</span>` : '<span class="chip">без пропусков</span>'}
         ${x.brief.length ? `<span class="chip warn">краткий формат (нет сделок и расшифровки списаний): ${x.brief.join(', ')}</span>` : ''}
-        <button data-del="${esc(x.a)}">удалить счёт</button></div>`).join('') || '<p class="note">Пока ничего не загружено.</p>'}
+        ${x.rec.length ? `<span class="chip ${x.bad.length ? 'warn' : ''}" title="Каждая справка: разобранные строки против итогов брокера «Виды движений денежных средств» — остаток, ввод и вывод, купоны, брокер, налоги, иное, маржа, биржевой сбор">сверка с итогами брокера: ${x.bad.length ? `расхождения в ${x.bad.length} из ${x.rec.length} справок` : `${x.rec.length} справок, всё до копейки`}</span>` : ''}
+        <button data-del="${esc(x.a)}">удалить счёт</button></div>
+      ${x.bad.length ? `<div class="rejected" style="margin-top:0"><h2>Сверка с итогами брокера: расхождения</h2>
+        <p class="note" style="margin:0 0 6px">Разобранные строки справки не сошлись с итогами брокера. Цифрам по этим справкам в затратах и сводке доверять осторожно; пришлите справку автору (без номера счёта), чтобы поправить разбор.</p>
+        <div class="tbl"><table><thead><tr><th>Справка</th><th>Строка</th><th class="n">По разбору</th><th class="n">У брокера</th><th class="n">Разница</th></tr></thead><tbody>
+        ${x.bad.flatMap(b => b.rows.filter(y => !y.ok).map(y => `<tr><td>${ddmm(b.r.date)}${b.r.dateTo !== b.r.date ? '–' + ddmm(b.r.dateTo) : ''}</td><td>${esc(y.name)}</td><td class="n">${fmt(y.ours, 2)}</td><td class="n">${fmt(y.broker, 2)}</td><td class="n neg">${fmt(y.ours - y.broker, 2)}</td></tr>`)).join('')}
+        </tbody></table></div></div>` : ''}`).join('') || '<p class="note">Пока ничего не загружено.</p>'}
     ${(state.periodWarn || []).length ? `<div class="infobox"><h2>Как совмещены справки за период и однодневные</h2><p class="note" style="margin:0 0 6px">Страница выбирает сама, удалять ничего не нужно. Кнопки — если хотите решить иначе.</p><ul>${state.periodWarn.map((w, i) => `<li>${esc(w.text)}
       <button data-delkey="${i}|p">удалить эту справку за период</button>${w.dailyKeys.length ? ` <button data-delkey="${i}|d">удалить однодневные за эти даты (${w.dailyKeys.length})</button>` : ''}</li>`).join('')}</ul></div>` : ''}
     ${state.lastLoad ? `<p class="note">Последняя загрузка: принято ${state.lastLoad.ok} из ${state.lastLoad.total}${state.lastLoad.replaced ? `, из них ${state.lastLoad.replaced} заменили уже загруженные дни` : ''}.</p>` : ''}
