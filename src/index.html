@@ -519,7 +519,7 @@ function buildAccount(reps) {
     if (side > 0) { f.buy += amtNkd || amt; f.nkdBuy += nkd; } else { f.sell += amtNkd || amt; f.nkdSell += nkd; }
   }
   const days = [];
-  let prevPending = null, prevDate = null;
+  let prevPending = null, prevDate = null, prevR = null;
   for (const r of reps) {
     const fut = futByDay[r.date] || {};
     let lots = 0, exchTrades = 0; for (const c in fut) { lots += fut[c].lots; exchTrades += fut[c].fee; }
@@ -536,8 +536,11 @@ function buildAccount(reps) {
                 transfers: (r.moves || []).filter(m => m.kind === 'transfer').reduce((a, m) => a + m.amount, 0),
                 external: (r.moves || []).filter(m => m.kind === 'external').reduce((a, m) => a + m.amount, 0),
                 vm: 0, costs: {} };
-    // клиринга в выходные нет: в субботней и воскресной справке колонка «план» повторяет пятничную маржу
-    d.clearing = weekday(r.date) % 6 !== 0;
+    // клиринга в выходные и праздники нет: в справке за такой день «план» повторяет маржу предыдущего дня,
+    // а «факт» нулевой (праздник по дню недели не узнать — узнаём по повтору)
+    const P = r.positions, pp = prevR && prevR.date === addDays(r.date, -1) && !r.partial && !prevR.partial ? prevR.positions : null;
+    const repeat = pp && Object.keys(P).length && Object.values(P).every(p => !p.fact) && Object.keys(P).every(c => Math.abs((P[c].vm || 0) - (pp[c]?.vm || 0)) < 0.005);
+    d.clearing = weekday(r.date) % 6 !== 0 && !repeat; prevR = r;
     d.vmByCode = {};
     if (d.clearing) for (const c in r.positions) { d.vmByCode[c] = r.positions[c].vm; d.vm += r.positions[c].vm; }
     d.pnl = d.equity - d.equityStart - d.flowsIn;
@@ -566,16 +569,13 @@ function buildAccount(reps) {
   const perp = new Set(), K = {};
   // брокер пишет «фандинг 0» и у срочных фьючерсов — вечным считаем контракт, где фандинг хоть раз ненулевой
   for (const d of days) for (const c in d.fut) { if (d.fut[c].fundRate) perp.add(c); if (d.fut[c].k) K[c] = d.fut[c].k; }
-  // Со 02.11.2026 брокер сам пишет фандинг дня («план») — берём его. В выходные и праздники клиринга нет, а «план»
-  // повторяет предыдущий день при нулевом «факте» — такой день пропускаем.
-  let prev = null;
+  // Со 02.11.2026 брокер сам пишет фандинг дня («план») — берём его; в дни без клиринга (выходные, праздники) — ноль.
   for (const d of days) {
     d.funding = 0; d.fundingByCode = {}; d.fundingUnknown = [];
-    const P = d.r.positions, own = Object.values(P).some(p => p.fund !== undefined), pp = prev; prev = own ? P : null;
-    if (weekday(d.date) % 6 === 0) continue;
-    if (own) {
-      const repeat = pp && Object.values(P).every(p => !p.fundFact) && Object.keys(P).every(c => Math.abs((P[c].fund || 0) - (pp[c]?.fund || 0)) < 0.005);
-      if (!repeat) for (const c in P) if (P[c].fund) { perp.add(c); d.fundingByCode[c] = P[c].fund; d.funding += P[c].fund; }
+    if (!d.clearing) continue;
+    const P = d.r.positions;
+    if (Object.values(P).some(p => p.fund !== undefined)) {
+      for (const c in P) if (P[c].fund) { perp.add(c); d.fundingByCode[c] = P[c].fund; d.funding += P[c].fund; }
       continue;
     }
     for (const c of perp) {
