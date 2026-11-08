@@ -159,7 +159,7 @@ footer a { color: var(--dim); }
 
 // Меняйте при любом изменении того, что разборщик достаёт из справки: старые разборы в браузере
 // пересчитать нельзя (исходные файлы не хранятся), страница попросит загрузить их заново.
-const PARSER_VERSION = 9;
+const PARSER_VERSION = 10;
 const DATE_RE = /^\d\d\.\d\d\.\d{4}$/;
 function num(x) {
   if (!x) return 0;
@@ -259,10 +259,15 @@ function parseReport(s) {
       // 14 дивиденды/НКД, 15 брокер, 16 инв. советник, 17 налог списан, 18 налог удержан при выплате, 19 иное
       r.recon = { kinds: c.slice(0, 20).map(num), futVm: null, secFee: null };
   }
-  // позиции по ПФИ: 7 ВМ факт (оплачена сегодня), 8 ВМ план (за этот торговый день), 10 позиция на конец
+  // позиции по ПФИ: 7 ВМ факт (оплачена сегодня), 8 ВМ план (за этот торговый день), 10 позиция на конец.
+  // Со 02.11.2026 после ВМ идут «Фандинг (справочно) факт» и «план» (9, 10), позиция на конец сдвигается в 12.
+  // Фандинг брокер пишет со знаком, обратным денежному, и он уже входит в ВМ.
+  let fundCols = false;
   for (const c of rows(section(s, 'Оценка позиции по Производным', ['ГО срочного рынка', 'Оценка позиции по ценным']))) {
+    if (/^Вид договора/.test(c[0] || '')) fundCols = c.some(x => /^Фандинг/.test(x));
     if (c.length >= 11 && c[1] && c[0].startsWith(c[1] + ','))
-      r.positions[c[1]] = { pos: num(c[10]), pos0: num(c[2]), vm: num(c[8]), fact: num(c[7]), kind: c[0].split(',')[1]?.trim() || '' };
+      r.positions[c[1]] = { pos: num(c[fundCols ? 12 : 10]), pos0: num(c[2]), vm: num(c[8]), fact: num(c[7]), kind: c[0].split(',')[1]?.trim() || '',
+        ...(fundCols ? { fundFact: -num(c[9]), fund: -num(c[10]) } : {}) };
   }
   for (const c of rows(section(s, 'Оценка позиции по ценным бумагам и иностранным', ['Оценка обязательств по незавершенным', '2. Движения']))) {
     // 3 кол-во на начало, 5 оценка на начало (с НКД), 8 кол-во на конец, 10 оценка на конец (с НКД)
@@ -561,9 +566,18 @@ function buildAccount(reps) {
   const perp = new Set(), K = {};
   // брокер пишет «фандинг 0» и у срочных фьючерсов — вечным считаем контракт, где фандинг хоть раз ненулевой
   for (const d of days) for (const c in d.fut) { if (d.fut[c].fundRate) perp.add(c); if (d.fut[c].k) K[c] = d.fut[c].k; }
+  // Со 02.11.2026 брокер сам пишет фандинг дня («план») — берём его. В выходные и праздники клиринга нет, а «план»
+  // повторяет предыдущий день при нулевом «факте» — такой день пропускаем.
+  let prev = null;
   for (const d of days) {
     d.funding = 0; d.fundingByCode = {}; d.fundingUnknown = [];
+    const P = d.r.positions, own = Object.values(P).some(p => p.fund !== undefined), pp = prev; prev = own ? P : null;
     if (weekday(d.date) % 6 === 0) continue;
+    if (own) {
+      const repeat = pp && Object.values(P).every(p => !p.fundFact) && Object.keys(P).every(c => Math.abs((P[c].fund || 0) - (pp[c]?.fund || 0)) < 0.005);
+      if (!repeat) for (const c in P) if (P[c].fund) { perp.add(c); d.fundingByCode[c] = P[c].fund; d.funding += P[c].fund; }
+      continue;
+    }
     for (const c of perp) {
       const pos = d.r.positions[c]?.pos || 0; if (!pos) continue;
       let rate = d.fut[c]?.fundRate;
