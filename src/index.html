@@ -1306,7 +1306,9 @@ function dailyRates(sel) {
 function coverParts(d) {
   const p = { cash: d.r.money.out || 0, bonds: 0, shares: 0, funds: 0 };
   for (const k in d.r.holdings) { const h = d.r.holdings[k]; p[h.cls] = (p[h.cls] || 0) + h.val; }
-  for (const k in d.r.planned) { const h = d.r.planned[k]; if (!h.obligation && h.val) p[h.cls] = (p[h.cls] || 0) + h.val; }   // выданные в заём и т. п.
+  // незавершённые сделки: оценка минус обязательство по оплате — купленное до оплаты и проданное до поставки дают около
+  // нуля, а выданное в заём остаётся (даже если в тот же день по той же бумаге есть неоплаченная покупка)
+  for (const k in d.r.planned) { const h = d.r.planned[k]; p[h.cls] = (p[h.cls] || 0) + (h.val || 0) + (h.obligation || 0); }
   return p;
 }
 V.stock = (el, sel) => {
